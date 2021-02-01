@@ -85,7 +85,7 @@ use vm_allocator::SystemAllocator;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, LegacyIrqGroupConfig, MsiIrqGroupConfig,
 };
-use vm_device::{Bus, BusDevice, Resource};
+use vm_device::{Bus, BusDevice, BusType, Resource};
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::{
     Address, GuestAddress, GuestAddressSpace, GuestRegionMmap, GuestUsize, MmapRegion,
@@ -825,8 +825,8 @@ impl DeviceManager {
         let address_manager = Arc::new(AddressManager {
             allocator: memory_manager.lock().unwrap().allocator(),
             #[cfg(target_arch = "x86_64")]
-            io_bus: Arc::new(Bus::new()),
-            mmio_bus: Arc::new(Bus::new()),
+            io_bus: Arc::new(Bus::new(BusType::PortIo)),
+            mmio_bus: Arc::new(Bus::new(BusType::Mmio)),
             vm: vm.clone(),
             device_tree: Arc::clone(&device_tree),
         });

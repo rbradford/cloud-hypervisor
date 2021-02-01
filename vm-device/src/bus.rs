@@ -7,9 +7,10 @@
 
 //! Handles routing to devices in an address space.
 
+use std::cell::RefCell;
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::btree_map::BTreeMap;
-use std::sync::{Arc, Barrier, Mutex, RwLock, Weak};
+use std::sync::{atomic, atomic::AtomicU64, Arc, Barrier, Mutex, RwLock, Weak};
 use std::{convert, error, fmt, io, result};
 
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
@@ -91,30 +92,81 @@ impl PartialOrd for BusRange {
     }
 }
 
+pub enum BusType {
+    Mmio,
+    PortIo,
+}
+
+// Per thread (i.e. per vCPU thread) hold a cached copy. This prevents the need
+// to take a lock for lookups.
+struct BusThreadLocalCache {
+    age: u64,
+    devices: BTreeMap<BusRange, Weak<Mutex<dyn BusDevice>>>,
+}
+
+thread_local!(static IO_CACHE: RefCell<BusThreadLocalCache> = RefCell::new(BusThreadLocalCache { age: 0, devices: BTreeMap::new() }));
+thread_local!(static MMIO_CACHE: RefCell<BusThreadLocalCache> = RefCell::new(BusThreadLocalCache { age: 0, devices: BTreeMap::new() }));
+
 /// A device container for routing reads and writes over some address space.
 ///
 /// This doesn't have any restrictions on what kind of device or address space this applies to. The
 /// only restriction is that no two devices can overlap in this address space.
-#[derive(Default)]
+
 pub struct Bus {
+    bus_type: BusType,
+    age: Arc<AtomicU64>,
     devices: RwLock<BTreeMap<BusRange, Weak<Mutex<dyn BusDevice>>>>,
 }
 
 impl Bus {
     /// Constructs an a bus with an empty address space.
-    pub fn new() -> Bus {
+    pub fn new(bus_type: BusType) -> Bus {
         Bus {
+            bus_type,
+            age: Arc::new(AtomicU64::new(1)),
             devices: RwLock::new(BTreeMap::new()),
         }
     }
 
     fn first_before(&self, addr: u64) -> Option<(BusRange, Arc<Mutex<dyn BusDevice>>)> {
-        let devices = self.devices.read().unwrap();
-        let (range, dev) = devices
-            .range(..=BusRange { base: addr, len: 1 })
-            .rev()
-            .next()?;
-        dev.upgrade().map(|d| (*range, d.clone()))
+        match self.bus_type {
+            BusType::Mmio => MMIO_CACHE.with(|c| {
+                // Check to see if our cache matches the current version; otherwise update cache
+                loop {
+                    let current_age = self.age.load(atomic::Ordering::Acquire);
+                    if current_age != c.borrow().age {
+                        c.borrow_mut().age = current_age;
+                        c.borrow_mut().devices = self.devices.read().unwrap().clone();
+                    } else {
+                        break;
+                    }
+                }
+                let devices = &c.borrow().devices;
+                let (range, dev) = devices
+                    .range(..=BusRange { base: addr, len: 1 })
+                    .rev()
+                    .next()?;
+                dev.upgrade().map(|d| (*range, d.clone()))
+            }),
+            BusType::PortIo => IO_CACHE.with(|c| {
+                // Check to see if our cache matches the current version; otherwise update cache
+                loop {
+                    let current_age = self.age.load(atomic::Ordering::Acquire);
+                    if current_age != c.borrow().age {
+                        c.borrow_mut().age = current_age;
+                        c.borrow_mut().devices = self.devices.read().unwrap().clone();
+                    } else {
+                        break;
+                    }
+                }
+                let devices = &c.borrow().devices;
+                let (range, dev) = devices
+                    .range(..=BusRange { base: addr, len: 1 })
+                    .rev()
+                    .next()?;
+                dev.upgrade().map(|d| (*range, d.clone()))
+            }),
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -155,6 +207,8 @@ impl Bus {
             return Err(Error::Overlap);
         }
 
+        self.age.fetch_add(1, atomic::Ordering::Release);
+
         Ok(())
     }
 
@@ -169,6 +223,8 @@ impl Bus {
         if self.devices.write().unwrap().remove(&bus_range).is_none() {
             return Err(Error::MissingAddressRange);
         }
+
+        self.age.fetch_add(1, atomic::Ordering::Release);
 
         Ok(())
     }
@@ -187,6 +243,8 @@ impl Bus {
         for key in remove_key_list.iter() {
             device_list.remove(key);
         }
+
+        self.age.fetch_add(1, atomic::Ordering::Release);
 
         Ok(())
     }
@@ -270,7 +328,7 @@ mod tests {
 
     #[test]
     fn bus_insert() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::PortIo);
         let dummy = Arc::new(Mutex::new(DummyDevice));
         assert!(bus.insert(dummy.clone(), 0x10, 0).is_err());
         assert!(bus.insert(dummy.clone(), 0x10, 0x10).is_ok());
@@ -292,7 +350,7 @@ mod tests {
     #[test]
     #[allow(clippy::redundant_clone)]
     fn bus_read_write() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::PortIo);
         let dummy = Arc::new(Mutex::new(DummyDevice));
         assert!(bus.insert(dummy.clone(), 0x10, 0x10).is_ok());
         assert!(bus.read(0x10, &mut [0, 0, 0, 0]).is_ok());
@@ -310,7 +368,7 @@ mod tests {
     #[test]
     #[allow(clippy::redundant_clone)]
     fn bus_read_write_values() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::PortIo);
         let dummy = Arc::new(Mutex::new(ConstantDevice));
         assert!(bus.insert(dummy.clone(), 0x10, 0x10).is_ok());
 
@@ -335,7 +393,7 @@ mod tests {
 
         assert_eq!(range, range.clone());
 
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::PortIo);
         let mut data = [1, 2, 3, 4];
         let device = Arc::new(Mutex::new(DummyDevice));
         assert!(bus.insert(device.clone(), 0x10, 0x10).is_ok());

@@ -378,7 +378,7 @@ impl VmOps {
     fn log_debug_ioport(&self, code: u8) {
         let elapsed = self.timestamp.elapsed();
 
-        debug!(
+        error!(
             "[{} code 0x{:x}] {}.{:>06} seconds",
             DebugIoPortRange::from_u8(code),
             code,

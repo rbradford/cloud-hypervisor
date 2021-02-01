@@ -12,7 +12,7 @@ use std::io;
 mod bus;
 pub mod interrupt;
 
-pub use self::bus::{Bus, BusDevice, Error as BusError};
+pub use self::bus::{Bus, BusDevice, BusType, Error as BusError};
 
 #[derive(Debug)]
 pub enum Error {
