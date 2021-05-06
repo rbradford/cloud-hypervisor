@@ -1,9 +1,7 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::net_util::{
-    build_net_config_space, NetCtrl, NetCtrlEpollHandler, VirtioNetConfig,
-};
+use super::super::net_util::{build_net_config_space, VirtioNetConfig};
 use super::super::{
     ActivateError, ActivateResult, Queue, VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
@@ -222,8 +220,8 @@ impl VirtioDevice for Net {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<Queue>,
-        mut queue_evts: Vec<EventFd>,
+        queues: Vec<Queue>,
+        queue_evts: Vec<EventFd>,
     ) -> ActivateResult {
         self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
 
@@ -231,14 +229,23 @@ impl VirtioDevice for Net {
 
         let queue_num = self.common.queue_evts.as_ref().unwrap().len();
 
+        let mut vu_interrupt_list = setup_vhost_user(
+            &mut self.vhost_user_net,
+            &mem.memory(),
+            queues,
+            queue_evts,
+            &interrupt_cb,
+            self.common.acked_features & self.backend_features,
+        )
+        .map_err(ActivateError::VhostUserNetSetup)?;
+
+        let mut epoll_threads = Vec::new();
+
         if self
             .common
             .feature_acked(virtio_net::VIRTIO_NET_F_CTRL_VQ.into())
             && queue_num % 2 != 0
         {
-            let cvq_queue = queues.remove(queue_num - 1);
-            let cvq_queue_evt = queue_evts.remove(queue_num - 1);
-
             let kill_evt = self
                 .common
                 .kill_evt
@@ -260,12 +267,13 @@ impl VirtioDevice for Net {
                     ActivateError::BadActivate
                 })?;
 
-            let mut ctrl_handler = NetCtrlEpollHandler {
-                mem: mem.clone(),
+            let mut handler = VhostUserEpollHandler::<SlaveReqHandler>::new(VhostUserEpollConfig {
+                interrupt_cb: interrupt_cb.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: NetCtrl::new(cvq_queue, cvq_queue_evt, None),
-            };
+                vu_interrupt_list: vec![vu_interrupt_list.remove(queue_num - 1)],
+                slave_req_handler: None,
+            });
 
             let paused = self.common.paused.clone();
             // Let's update the barrier as we need 1 for each RX/TX pair +
@@ -273,36 +281,25 @@ impl VirtioDevice for Net {
             // the pause.
             self.common.paused_sync = Some(Arc::new(Barrier::new((queue_num / 2) + 2)));
             let paused_sync = self.common.paused_sync.clone();
-            let virtio_vhost_net_ctl_seccomp_filter =
-                get_seccomp_filter(&self.seccomp_action, Thread::VirtioVhostNetCtl)
+            let virtio_vhost_net_seccomp_filter =
+                get_seccomp_filter(&self.seccomp_action, Thread::VirtioVhostNet)
                     .map_err(ActivateError::CreateSeccompFilter)?;
             thread::Builder::new()
-                .name(format!("{}_ctrl", self.id))
+                .name(format!("{}_ctrl", self.id.clone()))
                 .spawn(move || {
-                    if let Err(e) = SeccompFilter::apply(virtio_vhost_net_ctl_seccomp_filter) {
+                    if let Err(e) = SeccompFilter::apply(virtio_vhost_net_seccomp_filter) {
                         error!("Error applying seccomp filter: {:?}", e);
-                    } else if let Err(e) = ctrl_handler.run_ctrl(paused, paused_sync.unwrap()) {
+                    } else if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
                         error!("Error running worker: {:?}", e);
                     }
                 })
-                .map(|thread| self.ctrl_queue_epoll_thread = Some(thread))
+                .map(|thread| epoll_threads.push(thread))
                 .map_err(|e| {
                     error!("failed to clone queue EventFd: {}", e);
                     ActivateError::BadActivate
                 })?;
         }
 
-        let mut vu_interrupt_list = setup_vhost_user(
-            &mut self.vhost_user_net,
-            &mem.memory(),
-            queues,
-            queue_evts,
-            &interrupt_cb,
-            self.common.acked_features & self.backend_features,
-        )
-        .map_err(ActivateError::VhostUserNetSetup)?;
-
-        let mut epoll_threads = Vec::new();
         for i in 0..vu_interrupt_list.len() / 2 {
             let interrupt_list_sub = vec![vu_interrupt_list.remove(0), vu_interrupt_list.remove(0)];
 
