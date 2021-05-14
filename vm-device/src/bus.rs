@@ -7,9 +7,10 @@
 
 //! Handles routing to devices in an address space.
 
+use arc_swap::ArcSwap;
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::btree_map::BTreeMap;
-use std::sync::{Arc, Barrier, Mutex, RwLock, Weak};
+use std::sync::{Arc, Barrier, Mutex, Weak};
 use std::{convert, error, fmt, io, result};
 
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
@@ -95,19 +96,19 @@ impl PartialOrd for BusRange {
 /// only restriction is that no two devices can overlap in this address space.
 #[derive(Default)]
 pub struct Bus {
-    devices: RwLock<BTreeMap<BusRange, Weak<Mutex<dyn BusDevice>>>>,
+    devices: ArcSwap<BTreeMap<BusRange, Weak<Mutex<dyn BusDevice>>>>,
 }
 
 impl Bus {
     /// Constructs an a bus with an empty address space.
     pub fn new() -> Bus {
         Bus {
-            devices: RwLock::new(BTreeMap::new()),
+            devices: ArcSwap::from_pointee(BTreeMap::new()),
         }
     }
 
     fn first_before(&self, addr: u64) -> Option<(BusRange, Arc<Mutex<dyn BusDevice>>)> {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.load();
         let (range, dev) = devices
             .range(..=BusRange { base: addr, len: 1 })
             .rev()
@@ -132,26 +133,22 @@ impl Bus {
             return Err(Error::ZeroSizedRange);
         }
 
+        let devices = self.devices.load();
+
         // Reject all cases where the new device's range overlaps with an existing device.
-        if self
-            .devices
-            .read()
-            .unwrap()
+        if devices
             .iter()
             .any(|(range, _dev)| range.overlaps(base, len))
         {
             return Err(Error::Overlap);
         }
 
-        if self
-            .devices
-            .write()
-            .unwrap()
-            .insert(BusRange { base, len }, Arc::downgrade(&device))
-            .is_some()
-        {
-            return Err(Error::Overlap);
-        }
+        self.devices.rcu(|devices| {
+            let mut devices = devices.as_ref().clone();
+
+            devices.insert(BusRange { base, len }, Arc::downgrade(&device));
+            devices
+        });
 
         Ok(())
     }
@@ -163,28 +160,36 @@ impl Bus {
         }
 
         let bus_range = BusRange { base, len };
-
-        if self.devices.write().unwrap().remove(&bus_range).is_none() {
+        if self.resolve(base).is_none() {
             return Err(Error::MissingAddressRange);
         }
+
+        self.devices.rcu(|devices| {
+            let mut devices = devices.as_ref().clone();
+            devices.remove(&bus_range);
+            devices
+        });
 
         Ok(())
     }
 
     /// Removes all entries referencing the given device.
     pub fn remove_by_device(&self, device: &Arc<Mutex<dyn BusDevice>>) -> Result<()> {
-        let mut device_list = self.devices.write().unwrap();
-        let mut remove_key_list = Vec::new();
+        self.devices.rcu(|devices| {
+            let mut devices = devices.as_ref().clone();
+            let mut remove_key_list = Vec::new();
 
-        for (key, value) in device_list.iter() {
-            if Arc::ptr_eq(&value.upgrade().unwrap(), device) {
-                remove_key_list.push(*key);
+            for (key, value) in devices.iter() {
+                if Arc::ptr_eq(&value.upgrade().unwrap(), device) {
+                    remove_key_list.push(*key);
+                }
             }
-        }
 
-        for key in remove_key_list.iter() {
-            device_list.remove(key);
-        }
+            for key in remove_key_list.iter() {
+                devices.remove(key);
+            }
+            devices
+        });
 
         Ok(())
     }
