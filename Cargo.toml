@@ -78,6 +78,7 @@ members = [
     "pci",
     "qcow",
     "rate_limiter",
+    "vfio_user",
     "vhost_user_backend",
     "vhost_user_block",
     "vhost_user_net",

@@ -1116,6 +1116,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfio_user"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "vfio-bindings",
+ "vm-memory",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "vhost"
 version = "0.1.0"
 source = "git+https://github.com/rust-vmm/vhost?branch=master#12fa07029bb4dd2293900c080d741f33b26b8698"
