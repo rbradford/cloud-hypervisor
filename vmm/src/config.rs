@@ -90,6 +90,10 @@ pub enum Error {
     #[cfg(feature = "tdx")]
     // No TDX firmware
     FirmwarePathMissing,
+    /// Failed to parse userspace device
+    ParseUserDevice(OptionParserError),
+    /// Missing socket for userspace device
+    ParseUserDeviceSocketMissing,
 }
 
 #[derive(Debug)]
@@ -224,6 +228,10 @@ impl fmt::Display for Error {
             ParseRestoreSourceUrlMissing => {
                 write!(f, "Error parsing --restore: source_url missing")
             }
+            ParseUserDeviceSocketMissing => {
+                write!(f, "Error parsing --user-device: socket missing")
+            }
+            ParseUserDevice(o) => write!(f, "Error parsing --user-device: {}", o),
             Validation(v) => write!(f, "Error validating configuration: {}", v),
             #[cfg(feature = "tdx")]
             ParseTdx(o) => write!(f, "Error parsing --tdx: {}", o),
@@ -251,6 +259,7 @@ pub struct VmParams<'a> {
     pub serial: &'a str,
     pub console: &'a str,
     pub devices: Option<Vec<&'a str>>,
+    pub user_devices: Option<Vec<&'a str>>,
     pub vsock: Option<&'a str>,
     #[cfg(target_arch = "x86_64")]
     pub sgx_epc: Option<Vec<&'a str>>,
@@ -280,6 +289,7 @@ impl<'a> VmParams<'a> {
         let fs: Option<Vec<&str>> = args.values_of("fs").map(|x| x.collect());
         let pmem: Option<Vec<&str>> = args.values_of("pmem").map(|x| x.collect());
         let devices: Option<Vec<&str>> = args.values_of("device").map(|x| x.collect());
+        let user_devices: Option<Vec<&str>> = args.values_of("user-device").map(|x| x.collect());
         let vsock: Option<&str> = args.value_of("vsock");
         #[cfg(target_arch = "x86_64")]
         let sgx_epc: Option<Vec<&str>> = args.values_of("sgx-epc").map(|x| x.collect());
@@ -303,6 +313,7 @@ impl<'a> VmParams<'a> {
             serial,
             console,
             devices,
+            user_devices,
             vsock,
             #[cfg(target_arch = "x86_64")]
             sgx_epc,
@@ -1534,6 +1545,38 @@ impl DeviceConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Default)]
+pub struct UserDeviceConfig {
+    pub socket: PathBuf,
+    #[serde(default)]
+    pub iommu: bool,
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+impl UserDeviceConfig {
+    pub const SYNTAX: &'static str =
+        "Userspace device socket=<socket_path>,iommu=on|off,id=<device_id>\"";
+    pub fn parse(user_device: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser.add("socket").add("iommu").add("id");
+        parser.parse(user_device).map_err(Error::ParseUserDevice)?;
+
+        let socket = parser
+            .get("socket")
+            .map(PathBuf::from)
+            .ok_or(Error::ParseUserDeviceSocketMissing)?;
+        let iommu = parser
+            .convert::<Toggle>("iommu")
+            .map_err(Error::ParseUserDevice)?
+            .unwrap_or(Toggle(false))
+            .0;
+
+        let id = parser.get("id");
+
+        Ok(UserDeviceConfig { socket, iommu, id })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Default)]
 pub struct VsockConfig {
     pub cid: u64,
     pub socket: PathBuf,
@@ -1764,6 +1807,7 @@ pub struct VmConfig {
     #[serde(default = "ConsoleConfig::default_console")]
     pub console: ConsoleConfig,
     pub devices: Option<Vec<DeviceConfig>>,
+    pub user_devices: Option<Vec<UserDeviceConfig>>,
     pub vsock: Option<VsockConfig>,
     #[serde(default)]
     pub iommu: bool,
@@ -1952,6 +1996,19 @@ impl VmConfig {
             devices = Some(device_config_list);
         }
 
+        let mut user_devices: Option<Vec<UserDeviceConfig>> = None;
+        if let Some(user_device_list) = &vm_params.user_devices {
+            let mut user_device_config_list = Vec::new();
+            for item in user_device_list.iter() {
+                let user_device_config = UserDeviceConfig::parse(item)?;
+                if user_device_config.iommu {
+                    iommu = true;
+                }
+                user_device_config_list.push(user_device_config);
+            }
+            user_devices = Some(user_device_config_list);
+        }
+
         let mut vsock: Option<VsockConfig> = None;
         if let Some(vs) = &vm_params.vsock {
             let vsock_config = VsockConfig::parse(vs)?;
@@ -2017,6 +2074,7 @@ impl VmConfig {
             serial,
             console,
             devices,
+            user_devices,
             vsock,
             iommu,
             #[cfg(target_arch = "x86_64")]
@@ -2625,6 +2683,7 @@ mod tests {
                 iommu: false,
             },
             devices: None,
+            user_devices: None,
             vsock: None,
             iommu: false,
             #[cfg(target_arch = "x86_64")]
