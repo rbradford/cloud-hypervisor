@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 //
 
+use crate::vfio_interrupt::{Interrupt, InterruptUpdateAction, VfioIntx, VfioMsi, VfioMsix};
 use crate::{
     msi_num_enabled_vectors, BarReprogrammingParams, MsiConfig, MsixCap, MsixConfig,
     PciBarConfiguration, PciBarRegionType, PciCapabilityId, PciClassCode, PciConfiguration,
-    PciDevice, PciDeviceError, PciHeaderType, PciSubclass, MSIX_TABLE_ENTRY_SIZE,
+    PciDevice, PciDeviceError, PciHeaderType, PciSubclass,
 };
-use byteorder::{ByteOrder, LittleEndian};
 use std::any::Any;
 use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
@@ -78,159 +78,6 @@ enum PciVfioSubclass {
 impl PciSubclass for PciVfioSubclass {
     fn get_register_value(&self) -> u8 {
         *self as u8
-    }
-}
-
-enum InterruptUpdateAction {
-    EnableMsi,
-    DisableMsi,
-    EnableMsix,
-    DisableMsix,
-}
-
-struct VfioIntx {
-    interrupt_source_group: Arc<Box<dyn InterruptSourceGroup>>,
-    enabled: bool,
-}
-
-struct VfioMsi {
-    cfg: MsiConfig,
-    cap_offset: u32,
-    interrupt_source_group: Arc<Box<dyn InterruptSourceGroup>>,
-}
-
-impl VfioMsi {
-    fn update(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
-        let old_enabled = self.cfg.enabled();
-
-        self.cfg.update(offset, data);
-
-        let new_enabled = self.cfg.enabled();
-
-        if !old_enabled && new_enabled {
-            return Some(InterruptUpdateAction::EnableMsi);
-        }
-
-        if old_enabled && !new_enabled {
-            return Some(InterruptUpdateAction::DisableMsi);
-        }
-
-        None
-    }
-}
-
-struct VfioMsix {
-    bar: MsixConfig,
-    cap: MsixCap,
-    cap_offset: u32,
-    interrupt_source_group: Arc<Box<dyn InterruptSourceGroup>>,
-}
-
-impl VfioMsix {
-    fn update(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
-        let old_enabled = self.bar.enabled();
-
-        // Update "Message Control" word
-        if offset == 2 && data.len() == 2 {
-            self.bar.set_msg_ctl(LittleEndian::read_u16(data));
-        }
-
-        let new_enabled = self.bar.enabled();
-
-        if !old_enabled && new_enabled {
-            return Some(InterruptUpdateAction::EnableMsix);
-        }
-
-        if old_enabled && !new_enabled {
-            return Some(InterruptUpdateAction::DisableMsix);
-        }
-
-        None
-    }
-
-    fn table_accessed(&self, bar_index: u32, offset: u64) -> bool {
-        let table_offset: u64 = u64::from(self.cap.table_offset());
-        let table_size: u64 = u64::from(self.cap.table_size()) * (MSIX_TABLE_ENTRY_SIZE as u64);
-        let table_bir: u32 = self.cap.table_bir();
-
-        bar_index == table_bir && offset >= table_offset && offset < table_offset + table_size
-    }
-}
-
-struct Interrupt {
-    intx: Option<VfioIntx>,
-    msi: Option<VfioMsi>,
-    msix: Option<VfioMsix>,
-}
-
-impl Interrupt {
-    fn update_msi(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
-        if let Some(ref mut msi) = &mut self.msi {
-            let action = msi.update(offset, data);
-            return action;
-        }
-
-        None
-    }
-
-    fn update_msix(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
-        if let Some(ref mut msix) = &mut self.msix {
-            let action = msix.update(offset, data);
-            return action;
-        }
-
-        None
-    }
-
-    fn accessed(&self, offset: u64) -> Option<(PciCapabilityId, u64)> {
-        if let Some(msi) = &self.msi {
-            if offset >= u64::from(msi.cap_offset)
-                && offset < u64::from(msi.cap_offset) + msi.cfg.size()
-            {
-                return Some((
-                    PciCapabilityId::MessageSignalledInterrupts,
-                    u64::from(msi.cap_offset),
-                ));
-            }
-        }
-
-        if let Some(msix) = &self.msix {
-            if offset == u64::from(msix.cap_offset) {
-                return Some((PciCapabilityId::MsiX, u64::from(msix.cap_offset)));
-            }
-        }
-
-        None
-    }
-
-    fn msix_table_accessed(&self, bar_index: u32, offset: u64) -> bool {
-        if let Some(msix) = &self.msix {
-            return msix.table_accessed(bar_index, offset);
-        }
-
-        false
-    }
-
-    fn msix_write_table(&mut self, offset: u64, data: &[u8]) {
-        if let Some(ref mut msix) = &mut self.msix {
-            let offset = offset - u64::from(msix.cap.table_offset());
-            msix.bar.write_table(offset, data)
-        }
-    }
-
-    fn msix_read_table(&self, offset: u64, data: &mut [u8]) {
-        if let Some(msix) = &self.msix {
-            let offset = offset - u64::from(msix.cap.table_offset());
-            msix.bar.read_table(offset, data)
-        }
-    }
-
-    fn intx_in_use(&self) -> bool {
-        if let Some(intx) = &self.intx {
-            return intx.enabled;
-        }
-
-        false
     }
 }
 

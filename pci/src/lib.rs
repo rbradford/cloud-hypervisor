@@ -12,6 +12,7 @@ mod device;
 mod msi;
 mod msix;
 mod vfio;
+mod vfio_interrupt;
 
 pub use self::bus::{PciBus, PciConfigIo, PciConfigMmio, PciRoot, PciRootError};
 pub use self::configuration::{
