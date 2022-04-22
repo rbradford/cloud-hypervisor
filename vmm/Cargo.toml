@@ -2,11 +2,10 @@
 name = "vmm"
 version = "0.1.0"
 authors = ["The Cloud Hypervisor Authors"]
-edition = "2018"
+edition = "2021"
 
 [features]
 default = []
-acpi = ["acpi_tables","devices/acpi", "arch/acpi"]
 amx = []
 cmos = ["devices/cmos"]
 fwdebug = ["devices/fwdebug"]
@@ -16,13 +15,13 @@ mshv = ["hypervisor/mshv", "virtio-devices/mshv", "vfio-ioctls/mshv", "vm-device
 tdx = ["arch/tdx", "hypervisor/tdx"]
 
 [dependencies]
-acpi_tables = { path = "../acpi_tables", optional = true }
-anyhow = "1.0.56"
+acpi_tables = { path = "../acpi_tables" }
+anyhow = "1.0.57"
 arc-swap = "1.5.0"
 arch = { path = "../arch" }
 bitflags = "1.3.2"
 block_util = { path = "../block_util" }
-clap = "3.1.6"
+clap = "3.1.10"
 devices = { path = "../devices" }
 epoll = "4.3.1"
 event_monitor = { path = "../event_monitor" }
@@ -30,7 +29,7 @@ gdbstub = "0.6.1"
 gdbstub_arch = "0.2.2"
 hypervisor = { path = "../hypervisor" }
 lazy_static = "1.4.0"
-libc = "0.2.121"
+libc = "0.2.124"
 linux-loader = { version = "0.4.0", features = ["elf", "bzimage", "pe"] }
 log = "0.4.16"
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http", branch = "main" }
@@ -44,7 +43,7 @@ serde_derive = "1.0.136"
 serde_json = "1.0.79"
 signal-hook = "0.3.13"
 thiserror = "1.0.30"
-uuid = "0.8.2"
+uuid = "1.0.0"
 versionize = "0.1.6"
 versionize_derive = "0.1.4"
 vfio-ioctls = { git = "https://github.com/rust-vmm/vfio", branch = "main", default-features = false }
@@ -54,7 +53,7 @@ virtio-devices = { path = "../virtio-devices" }
 virtio-queue = "0.2.0"
 vm-allocator = { path = "../vm-allocator" }
 vm-device = { path = "../vm-device" }
-vm-memory = { version = "0.7.0", features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
+vm-memory = { version = "0.8.0", features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
 vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { version = "0.9.0", features = ["with-serde"] }

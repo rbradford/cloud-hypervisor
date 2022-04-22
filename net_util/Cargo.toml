@@ -2,12 +2,12 @@
 name = "net_util"
 version = "0.1.0"
 authors = ["The Chromium OS Authors"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 epoll = "4.3.1"
 getrandom = "0.2"
-libc = "0.2.121"
+libc = "0.2.124"
 log = "0.4.16"
 net_gen = { path = "../net_gen" }
 rate_limiter = { path = "../rate_limiter" }
@@ -16,7 +16,7 @@ versionize = "0.1.6"
 versionize_derive = "0.1.4"
 virtio-bindings = "0.1.0"
 virtio-queue = "0.2.0"
-vm-memory = { version = "0.7.0", features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
+vm-memory = { version = "0.8.0", features = ["backend-mmap", "backend-atomic", "backend-bitmap"] }
 vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = "0.9.0"
 
