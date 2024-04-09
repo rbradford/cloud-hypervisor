@@ -759,7 +759,7 @@ pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
     eprintln!("blocksize = {blocksize} ptr = {ptr:?}");
     let mut data = unsafe { std::slice::from_raw_parts(ptr, blocksize) };
     f.read_exact(&mut data)?;
-    Ok(data)
+    Ok(data.to_vec())
 }
 
 /// Determine image type through file parsing.
