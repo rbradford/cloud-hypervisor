@@ -755,14 +755,9 @@ pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
     // SAFETY: We are allocating memory that is naturally aligned (size = alignment) and we meet
     // requirements for safety from Vec::from_raw_parts() as we are using the global allocator
     // and transferring ownership of the memory.
-    eprintln!("blocksize = {blocksize} size = {size}");
-    let mut data = unsafe {
-        Vec::from_raw_parts(
-            alloc_zeroed(Layout::from_size_align_unchecked(blocksize, blocksize)),
-            blocksize,
-            blocksize,
-        )
-    };
+    let ptr = unsafe { alloc_zeroed(Layout::from_size_align_unchecked(blocksize, blocksize)) };
+    eprintln!("blocksize = {blocksize} ptr = {ptr:?}");
+    let mut data = unsafe { Vec::from_raw_parts(ptr, blocksize, blocksize) };
     f.read_exact(&mut data)?;
     Ok(data)
 }
