@@ -757,7 +757,7 @@ pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
     // and transferring ownership of the memory.
     let ptr = unsafe { alloc_zeroed(Layout::from_size_align_unchecked(blocksize, blocksize)) };
     eprintln!("blocksize = {blocksize} ptr = {ptr:?}");
-    let mut data = unsafe { std::slice::from_raw_parts(ptr, blocksize) };
+    let mut data = unsafe { std::slice::from_raw_parts_mut(ptr, blocksize) };
     f.read_exact(&mut data)?;
     Ok(data.to_vec())
 }
