@@ -302,6 +302,7 @@ impl<S: VhostUserFrontendReqHandler> EpollHelperHandler for VhostUserEpollHandle
 #[derive(Serialize, Deserialize)]
 pub struct VhostUserSnapshot<T> {
     pub device_state: T,
+    pub vring_bases: Option<Vec<u64>>,
 }
 
 #[derive(Default)]
@@ -313,6 +314,7 @@ pub struct VhostUserCommon {
     pub migration_started: bool,
     pub server: bool,
     pub interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
+    pub vring_bases: Option<Vec<u64>>,
 }
 
 impl VhostUserCommon {
@@ -353,8 +355,13 @@ impl VhostUserCommon {
                 acked_features,
                 &backend_req_handler,
                 inflight.as_mut(),
+                self.vring_bases.as_deref(),
             )
             .map_err(ActivateError::VhostUserSetup)?;
+
+        // Clear saved vring bases after first use — subsequent reconnects
+        // read the live avail_idx from guest memory, which is correct.
+        self.vring_bases = None;
 
         self.interrupt_cb = Some(interrupt_cb.clone());
 
@@ -456,6 +463,7 @@ impl VhostUserCommon {
     {
         let wrapped = VhostUserSnapshot {
             device_state: state,
+            vring_bases: None,
         };
         let snapshot = Snapshot::new_from_state(&wrapped)?;
 

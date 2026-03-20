@@ -164,6 +164,7 @@ impl VhostUserHandle {
         acked_features: u64,
         backend_req_handler: &Option<FrontendReqHandler<S>>,
         inflight: Option<&mut Inflight>,
+        vring_bases: Option<&[u64]>,
     ) -> Result<()> {
         self.vu
             .set_features(acked_features)
@@ -207,7 +208,7 @@ impl VhostUserHandle {
         }
 
         let mut vrings_info = Vec::new();
-        for (queue_index, queue, queue_evt) in queues.iter() {
+        for (i, (queue_index, queue, queue_evt)) in queues.iter().enumerate() {
             let actual_size: usize = queue.size().into();
 
             let config_data = VringConfigData {
@@ -247,14 +248,17 @@ impl VhostUserHandle {
             self.vu
                 .set_vring_addr(*queue_index, &config_data)
                 .map_err(Error::VhostUserSetVringAddr)?;
+            let base = if let Some(bases) = vring_bases {
+                // Use saved vring base from snapshot (first activation after restore)
+                bases[i] as u16
+            } else {
+                queue
+                    .avail_idx(mem, Ordering::Acquire)
+                    .map_err(Error::GetAvailableIndex)?
+                    .0
+            };
             self.vu
-                .set_vring_base(
-                    *queue_index,
-                    queue
-                        .avail_idx(mem, Ordering::Acquire)
-                        .map_err(Error::GetAvailableIndex)?
-                        .0,
-                )
+                .set_vring_base(*queue_index, base)
                 .map_err(Error::VhostUserSetVringBase)?;
 
             if let Some(eventfd) =
@@ -359,6 +363,7 @@ impl VhostUserHandle {
             acked_features,
             backend_req_handler,
             inflight,
+            None,
         )
     }
 
