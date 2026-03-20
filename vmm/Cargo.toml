@@ -59,7 +59,7 @@ landlock = "0.4.4"
 libc = { workspace = true }
 linux-loader = { workspace = true, features = ["bzimage", "elf", "pe"] }
 log = { workspace = true }
-micro_http = { git = "https://github.com/firecracker-microvm/micro-http", branch = "main" }
+micro_http = { git = "https://github.com/firecracker-microvm/micro-http", rev = "5c2254d6cf4f32a668d0d8e57ba20bebad9d4fba" }
 mshv-bindings = { workspace = true, features = [
   "fam-wrappers",
   "with-serde",

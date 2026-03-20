@@ -90,7 +90,7 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
-use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd};
+use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioOps};
 use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, VirtioTransport};
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
@@ -3862,8 +3862,11 @@ impl DeviceManager {
             vfio_container
         };
 
-        let vfio_device = VfioDevice::new(&device_cfg.path, Arc::clone(&vfio_container))
-            .map_err(DeviceManagerError::VfioCreate)?;
+        let vfio_device = VfioDevice::new(
+            &device_cfg.path,
+            Arc::clone(&vfio_container) as Arc<dyn VfioOps>,
+        )
+        .map_err(DeviceManagerError::VfioCreate)?;
 
         if needs_dma_mapping {
             // Register DMA mapping in IOMMU.
@@ -3879,8 +3882,8 @@ impl DeviceManager {
                     unsafe {
                         vfio_container.vfio_dma_map(
                             region.start_addr().raw_value(),
-                            region.len(),
-                            region.as_ptr() as u64,
+                            region.len() as usize,
+                            region.as_ptr(),
                         )
                     }
                     .map_err(DeviceManagerError::VfioDmaMap)?;
@@ -4514,8 +4517,8 @@ impl DeviceManager {
             unsafe {
                 vfio_container.vfio_dma_map(
                     new_region.start_addr().raw_value(),
-                    new_region.len(),
-                    new_region.as_ptr() as u64,
+                    new_region.len() as usize,
+                    new_region.as_ptr(),
                 )
             }
             .map_err(DeviceManagerError::UpdateMemoryForVfioPciDevice)?;
