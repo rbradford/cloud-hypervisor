@@ -2354,7 +2354,6 @@ dependencies = [
 [[package]]
 name = "vhost"
 version = "0.15.0"
-source = "git+https://github.com/rust-vmm/vhost?rev=c9b80a1c93bac7820e4aee4269aa904568937035#c9b80a1c93bac7820e4aee4269aa904568937035"
 dependencies = [
  "bitflags 2.11.0",
  "libc",
@@ -2366,7 +2365,6 @@ dependencies = [
 [[package]]
 name = "vhost-user-backend"
 version = "0.21.0"
-source = "git+https://github.com/rust-vmm/vhost?rev=c9b80a1c93bac7820e4aee4269aa904568937035#c9b80a1c93bac7820e4aee4269aa904568937035"
 dependencies = [
  "libc",
  "log",
