@@ -295,6 +295,15 @@ impl<S: VhostUserFrontendReqHandler> EpollHelperHandler for VhostUserEpollHandle
     }
 }
 
+/// Wrapper that pairs per-device state with common backend state for snapshots.
+///
+/// This is generic over T so each device type (fs, blk, net, generic) can use its
+/// own State struct without duplicating the backend state fields.
+#[derive(Serialize, Deserialize)]
+pub struct VhostUserSnapshot<T> {
+    pub device_state: T,
+}
+
 #[derive(Default)]
 pub struct VhostUserCommon {
     pub vu: Option<Arc<Mutex<VhostUserHandle>>>,
@@ -441,11 +450,14 @@ impl VhostUserCommon {
         Ok(())
     }
 
-    pub fn snapshot<'a, T>(&mut self, state: &T) -> std::result::Result<Snapshot, MigratableError>
+    pub fn snapshot<T>(&mut self, state: &T) -> std::result::Result<Snapshot, MigratableError>
     where
-        T: Serialize + Deserialize<'a>,
+        T: Serialize,
     {
-        let snapshot = Snapshot::new_from_state(state)?;
+        let wrapped = VhostUserSnapshot {
+            device_state: state,
+        };
+        let snapshot = Snapshot::new_from_state(&wrapped)?;
 
         if self.migration_started {
             self.shutdown();

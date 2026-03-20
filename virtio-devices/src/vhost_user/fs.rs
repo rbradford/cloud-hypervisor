@@ -22,7 +22,7 @@ use super::vu_common_ctrl::VhostUserHandle;
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
-use crate::vhost_user::VhostUserCommon;
+use crate::vhost_user::{VhostUserCommon, VhostUserSnapshot};
 use crate::{
     ActivateResult, GuestMemoryMmap, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM,
     VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt, VirtioSharedMemoryList,
@@ -94,7 +94,7 @@ impl Fs {
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         iommu: bool,
-        state: Option<State>,
+        state: Option<&VhostUserSnapshot<State>>,
     ) -> Result<Fs> {
         // Calculate the actual number of queues needed.
         let num_queues = NUM_QUEUE_OFFSET + req_num_queues;
@@ -109,7 +109,8 @@ impl Fs {
             vu_num_queues,
             config,
             paused,
-        ) = if let Some(state) = state {
+        ) = if let Some(snapshot) = state {
+            let state = &snapshot.device_state;
             info!("Restoring vhost-user-fs {id}");
 
             vu.set_protocol_features_vhost_user(

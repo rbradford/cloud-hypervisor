@@ -2642,7 +2642,8 @@ impl DeviceManager {
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
                     state_from_id(self.snapshot.as_ref(), id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
+                        .map_err(DeviceManagerError::RestoreGetState)?
+                        .as_ref(),
                 ) {
                     Ok(vub_device) => vub_device,
                     Err(e) => {
@@ -2946,7 +2947,8 @@ impl DeviceManager {
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
                     state_from_id(self.snapshot.as_ref(), id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
+                        .map_err(DeviceManagerError::RestoreGetState)?
+                        .as_ref(),
                     net_cfg.offload_tso,
                     net_cfg.offload_ufo,
                     net_cfg.offload_csum,
@@ -3152,7 +3154,8 @@ impl DeviceManager {
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
                     state_from_id(self.snapshot.as_ref(), id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
+                        .map_err(DeviceManagerError::RestoreGetState)?
+                        .as_ref(),
                 )
                 .map_err(DeviceManagerError::CreateGenericVhostUser)?,
             ));
@@ -3219,7 +3222,8 @@ impl DeviceManager {
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
                     state_from_id(self.snapshot.as_ref(), id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
+                        .map_err(DeviceManagerError::RestoreGetState)?
+                        .as_ref(),
                 )
                 .map_err(DeviceManagerError::CreateVirtioFs)?,
             ));

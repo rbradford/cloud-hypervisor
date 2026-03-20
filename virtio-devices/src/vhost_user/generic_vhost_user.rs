@@ -24,7 +24,7 @@ use super::vu_common_ctrl::VhostUserHandle;
 use super::{Error, Result};
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
-use crate::vhost_user::VhostUserCommon;
+use crate::vhost_user::{VhostUserCommon, VhostUserSnapshot};
 use crate::{
     ActivateResult, GuestMemoryMmap, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM,
     VirtioCommon, VirtioDevice, VirtioInterrupt, VirtioSharedMemoryList,
@@ -68,7 +68,7 @@ impl GenericVhostUser {
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         iommu: bool,
-        state: Option<State>,
+        state: Option<&VhostUserSnapshot<State>>,
     ) -> Result<GenericVhostUser> {
         // Calculate the actual number of queues needed.
         let num_queues = request_queue_sizes.len();
@@ -77,7 +77,8 @@ impl GenericVhostUser {
         let mut vu = VhostUserHandle::connect_vhost_user(false, path, num_queues as u64, false)?;
 
         let (avail_features, acked_features, acked_protocol_features, vu_num_queues, paused) =
-            if let Some(state) = state {
+            if let Some(snapshot) = state {
+                let state = &snapshot.device_state;
                 info!("Restoring generic vhost-user {id}");
                 vu.set_protocol_features_vhost_user(
                     state.acked_features,
