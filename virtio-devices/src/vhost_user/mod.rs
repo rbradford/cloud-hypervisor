@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
 
 use anyhow::anyhow;
-use log::error;
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vhost::Error as VhostError;
@@ -126,6 +126,12 @@ pub enum Error {
     VhostUserSetInflight(#[source] VhostError),
     #[error("Failed setting the log base")]
     VhostUserSetLogBase(#[source] VhostError),
+    #[error("Failed setting device state fd")]
+    VhostUserSetDeviceStateFd(#[source] VhostError),
+    #[error("Failed checking device state")]
+    VhostUserCheckDeviceState(#[source] VhostError),
+    #[error("Failed saving or restoring backend state")]
+    SaveRestoreBackendState(#[source] io::Error),
     #[error("Invalid used address")]
     UsedAddress,
     #[error("Invalid features provided from vhost-user backend")]
@@ -303,6 +309,7 @@ impl<S: VhostUserFrontendReqHandler> EpollHelperHandler for VhostUserEpollHandle
 pub struct VhostUserSnapshot<T> {
     pub device_state: T,
     pub vring_bases: Option<Vec<u64>>,
+    pub backend_state: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -461,9 +468,29 @@ impl VhostUserCommon {
     where
         T: Serialize,
     {
+        let (backend_state, vring_bases) = if let Some(vu) = &self.vu {
+            let mut vu_locked = vu.lock().unwrap();
+            if vu_locked.supports_device_state() {
+                match vu_locked.save_backend_state() {
+                    Ok((bs, vb)) => (Some(bs), Some(vb)),
+                    Err(e) => {
+                        warn!(
+                            "Failed to save backend device state, falling back to stateless restore: {e:?}"
+                        );
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
         let wrapped = VhostUserSnapshot {
             device_state: state,
-            vring_bases: None,
+            backend_state,
+            vring_bases,
         };
         let snapshot = Snapshot::new_from_state(&wrapped)?;
 

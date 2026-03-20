@@ -3,7 +3,8 @@
 
 use std::ffi;
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::io::{Read as _, Write as _};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -13,7 +14,8 @@ use std::time::{Duration, Instant};
 use log::{error, info};
 use vhost::vhost_kern::vhost_binding::{VHOST_F_LOG_ALL, VHOST_VRING_F_LOG};
 use vhost::vhost_user::message::{
-    VhostUserHeaderFlag, VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+    VhostTransferStateDirection, VhostTransferStatePhase, VhostUserHeaderFlag, VhostUserInflight,
+    VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{
     Frontend, FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler,
@@ -36,6 +38,23 @@ use crate::{
 // Size of a dirty page for vhost-user.
 const VHOST_LOG_PAGE: u64 = 0x1000;
 
+/// Create a pipe and return both ends as `OwnedFd`.
+fn create_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0i32; 2];
+    // SAFETY: fds is a valid pointer to an array of two i32s
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret < 0 {
+        return Err(Error::SaveRestoreBackendState(
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: pipe2() succeeded, fds[0] is a valid file descriptor
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: pipe2() succeeded, fds[1] is a valid file descriptor
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((read_fd, write_fd))
+}
+
 #[derive(Debug, Clone)]
 pub struct VhostUserConfig {
     pub socket: String,
@@ -54,6 +73,7 @@ pub struct VhostUserHandle {
     vu: Frontend,
     ready: bool,
     supports_migration: bool,
+    supports_device_state: bool,
     shm_log: Option<Arc<MmapRegion>>,
     acked_features: u64,
     vrings_info: Option<Vec<VringInfo>>,
@@ -387,6 +407,7 @@ impl VhostUserHandle {
                 vu: Frontend::from_stream(stream, num_queues),
                 ready: false,
                 supports_migration: false,
+                supports_device_state: false,
                 shm_log: None,
                 acked_features: 0,
                 vrings_info: None,
@@ -403,6 +424,7 @@ impl VhostUserHandle {
                             vu: m,
                             ready: false,
                             supports_migration: false,
+                            supports_device_state: false,
                             shm_log: None,
                             acked_features: 0,
                             vrings_info: None,
@@ -449,6 +471,120 @@ impl VhostUserHandle {
         {
             self.supports_migration = true;
         }
+        self.supports_device_state =
+            acked_protocol_features & VhostUserProtocolFeatures::DEVICE_STATE.bits() != 0;
+    }
+
+    pub fn supports_device_state(&self) -> bool {
+        self.supports_device_state
+    }
+
+    /// Save backend device state via the SET_DEVICE_STATE_FD protocol.
+    ///
+    /// Precondition: vrings must already be disabled (paused).
+    /// This method calls GET_VRING_BASE per queue to fully stop the backend,
+    /// then transfers the backend's internal state via a pipe.
+    ///
+    /// Returns the opaque state blob and per-queue vring base indices.
+    pub fn save_backend_state(&mut self) -> Result<(Vec<u8>, Vec<u64>)> {
+        // GET_VRING_BASE for each queue to stop the backend and capture indices
+        let mut vring_bases = Vec::new();
+        for queue_index in &self.queue_indexes {
+            let base = self
+                .vu
+                .get_vring_base(*queue_index)
+                .map_err(Error::VhostUserGetVringBase)?;
+            vring_bases.push(base as u64);
+        }
+
+        // Create a pipe for the state transfer.
+        // For SAVE: we pass the write end to the backend, and read from the read end.
+        let (read_fd, write_fd) = create_pipe()?;
+
+        // Send SET_DEVICE_STATE_FD(SAVE, STOPPED) with the write end.
+        // Ownership of write_fd is moved into set_device_state_fd which
+        // closes it after sending to the backend via SCM_RIGHTS.
+        let mut read_file: File = match self
+            .vu
+            .set_device_state_fd(
+                VhostTransferStateDirection::SAVE,
+                VhostTransferStatePhase::STOPPED,
+                write_fd,
+            )
+            .map_err(Error::VhostUserSetDeviceStateFd)?
+        {
+            Some(file) => file,
+            None => read_fd.into(),
+        };
+
+        // Read all state from the pipe
+        let mut state = Vec::new();
+        read_file.read_to_end(&mut state).map_err(|e| {
+            Error::SaveRestoreBackendState(std::io::Error::other(format!(
+                "Failed to read backend state from pipe: {e}"
+            )))
+        })?;
+
+        // Verify the transfer succeeded
+        let result = self
+            .vu
+            .check_device_state()
+            .map_err(Error::VhostUserCheckDeviceState)?;
+        if result != 0 {
+            return Err(Error::SaveRestoreBackendState(std::io::Error::other(
+                format!("Backend reported error during state save: {result}"),
+            )));
+        }
+
+        Ok((state, vring_bases))
+    }
+
+    /// Restore backend device state via the SET_DEVICE_STATE_FD protocol.
+    ///
+    /// Sends the saved opaque state blob to the backend via a pipe.
+    pub fn restore_backend_state(&mut self, state: &[u8]) -> Result<()> {
+        // Create a pipe for the state transfer.
+        // For LOAD: we pass the read end to the backend, and write to the write end.
+        let (read_fd, write_fd) = create_pipe()?;
+
+        // Send SET_DEVICE_STATE_FD(LOAD, STOPPED) with the read end.
+        // Ownership of read_fd is moved into set_device_state_fd which
+        // closes it after sending to the backend via SCM_RIGHTS.
+        let mut write_file: File = match self
+            .vu
+            .set_device_state_fd(
+                VhostTransferStateDirection::LOAD,
+                VhostTransferStatePhase::STOPPED,
+                read_fd,
+            )
+            .map_err(Error::VhostUserSetDeviceStateFd)?
+        {
+            Some(file) => file,
+            None => write_fd.into(),
+        };
+
+        // Write the saved state to the pipe
+        write_file.write_all(state).map_err(|e| {
+            Error::SaveRestoreBackendState(std::io::Error::other(format!(
+                "Failed to write backend state to pipe: {e}"
+            )))
+        })?;
+
+        // Close the write end to signal EOF
+        drop(write_file);
+
+        // Verify the transfer succeeded
+        let result = self
+            .vu
+            .check_device_state()
+            .map_err(Error::VhostUserCheckDeviceState)?;
+        if result != 0 {
+            return Err(Error::SaveRestoreBackendState(std::io::Error::other(
+                format!("Backend reported error during state restore: {result}"),
+            )));
+        }
+
+        Ok(())
     }
 
     fn update_log_base(&mut self, last_ram_addr: u64) -> Result<Option<Arc<MmapRegion>>> {
