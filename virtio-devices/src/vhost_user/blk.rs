@@ -80,6 +80,7 @@ impl Blk {
             vu_num_queues,
             config,
             paused,
+            vring_bases,
         ) = if let Some(snapshot) = state {
             let state = &snapshot.device_state;
             info!("Restoring vhost-user-block {id}");
@@ -89,6 +90,10 @@ impl Blk {
                 state.acked_protocol_features,
             )?;
 
+            if let Some(backend_state) = &snapshot.backend_state {
+                vu.restore_backend_state(backend_state)?;
+            }
+
             (
                 state.avail_features,
                 state.acked_features,
@@ -96,6 +101,7 @@ impl Blk {
                 state.vu_num_queues,
                 state.config,
                 true,
+                snapshot.vring_bases.clone(),
             )
         } else {
             // Filling device and vring features VMM supports.
@@ -120,7 +126,8 @@ impl Blk {
                 | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
                 | VhostUserProtocolFeatures::REPLY_ACK
                 | VhostUserProtocolFeatures::INFLIGHT_SHMFD
-                | VhostUserProtocolFeatures::LOG_SHMFD;
+                | VhostUserProtocolFeatures::LOG_SHMFD
+                | VhostUserProtocolFeatures::DEVICE_STATE;
 
             let (acked_features, acked_protocol_features) =
                 vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
@@ -169,6 +176,7 @@ impl Blk {
                 num_queues,
                 config,
                 false,
+                None,
             )
         };
 
@@ -188,6 +196,7 @@ impl Blk {
                 acked_protocol_features,
                 socket_path: vu_cfg.socket,
                 vu_num_queues,
+                vring_bases,
                 ..Default::default()
             },
             id,
