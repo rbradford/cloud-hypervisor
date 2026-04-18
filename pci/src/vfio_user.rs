@@ -26,7 +26,9 @@ use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottabl
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::mmap::MmapRegion;
-use crate::vfio::{UserMemoryRegion, VFIO_COMMON_ID, Vfio, VfioCommon, VfioError};
+use crate::vfio::{
+    UserMemoryRegion, UserMemoryRegionState, VFIO_COMMON_ID, Vfio, VfioCommon, VfioError,
+};
 use crate::{
     BarReprogrammingParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError, PciSubclass,
     VfioPciError,
@@ -180,26 +182,29 @@ impl VfioUserPciDevice {
                         }
                     };
 
-                    let user_memory_region = UserMemoryRegion {
-                        slot: self.memory_slot_allocator.next_memory_slot(),
-                        start: mmio_region.start.0 + s.offset,
-                        mapping,
-                    };
+                    let slot = self.memory_slot_allocator.next_memory_slot();
+                    let start = mmio_region.start.0 + s.offset;
+                    let size = mapping.len() as u64;
 
                     // SAFETY: validity of len and host_addr guaranteed by hypervisor::mmap::MmapRegion
                     unsafe {
                         self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
+                            slot,
+                            start,
+                            mapping.len(),
+                            mapping.addr(),
                             false,
                             false,
                         )
                     }
                     .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
 
-                    mmio_region.user_memory_regions.push(user_memory_region);
+                    mmio_region.user_memory_regions.push(UserMemoryRegion {
+                        slot,
+                        start,
+                        size,
+                        state: UserMemoryRegionState::Installed { mapping },
+                    });
                 }
             }
         }
@@ -210,19 +215,21 @@ impl VfioUserPciDevice {
     fn unmap_mmio_regions(&mut self) {
         for mmio_region in self.common.mmio_regions.iter_mut() {
             for user_memory_region in mmio_region.user_memory_regions.drain(..) {
-                // Remove region
-                // SAFETY: guaranteed by hypervisor::mmap::MmapRegion invariants
-                if let Err(e) = unsafe {
-                    self.vm.remove_user_memory_region(
-                        user_memory_region.slot,
-                        user_memory_region.start,
-                        user_memory_region.mapping.len(),
-                        user_memory_region.mapping.addr(),
-                        false,
-                        false,
-                    )
-                } {
-                    error!("Could not remove the userspace memory region: {e}");
+                if let UserMemoryRegionState::Installed { mapping } = &user_memory_region.state {
+                    // Remove region
+                    // SAFETY: guaranteed by hypervisor::mmap::MmapRegion invariants
+                    if let Err(e) = unsafe {
+                        self.vm.remove_user_memory_region(
+                            user_memory_region.slot,
+                            user_memory_region.start,
+                            mapping.len(),
+                            mapping.addr(),
+                            false,
+                            false,
+                        )
+                    } {
+                        error!("Could not remove the userspace memory region: {e}");
+                    }
                 }
 
                 self.memory_slot_allocator
@@ -450,19 +457,28 @@ impl PciDevice for VfioUserPciDevice {
                 mmio_region.start = GuestAddress(new_base);
 
                 for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
-                    // Remove old region
-                    // SAFETY: only valid regions are in user_memory_regions
-                    unsafe {
-                        self.vm.remove_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                            false,
-                        )
+                    let installed = match &user_memory_region.state {
+                        UserMemoryRegionState::Installed { mapping } => {
+                            Some((mapping.len(), mapping.addr()))
+                        }
+                        UserMemoryRegionState::Pending { .. } => None,
+                    };
+
+                    if let Some((len, host_addr)) = installed {
+                        // Remove old region
+                        // SAFETY: only valid regions are in user_memory_regions
+                        unsafe {
+                            self.vm.remove_user_memory_region(
+                                user_memory_region.slot,
+                                user_memory_region.start,
+                                len,
+                                host_addr,
+                                false,
+                                false,
+                            )
+                        }
+                        .map_err(std::io::Error::other)?;
                     }
-                    .map_err(std::io::Error::other)?;
 
                     // Update the user memory region with the correct start address.
                     if new_base > old_base {
@@ -471,19 +487,21 @@ impl PciDevice for VfioUserPciDevice {
                         user_memory_region.start -= old_base - new_base;
                     }
 
-                    // Insert new region
-                    // SAFETY: only valid regions are in user_memory_regions
-                    unsafe {
-                        self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                            false,
-                        )
+                    if let Some((len, host_addr)) = installed {
+                        // Insert new region
+                        // SAFETY: only valid regions are in user_memory_regions
+                        unsafe {
+                            self.vm.create_user_memory_region(
+                                user_memory_region.slot,
+                                user_memory_region.start,
+                                len,
+                                host_addr,
+                                false,
+                                false,
+                            )
+                        }
+                        .map_err(std::io::Error::other)?;
                     }
-                    .map_err(std::io::Error::other)?;
                 }
                 info!("Moved bar 0x{old_base:x} -> 0x{new_base:x}");
             }
