@@ -1648,140 +1648,153 @@ impl VfioPciDevice {
         let fd = self.device.as_raw_fd();
         // SAFETY: fd is guaranteed valid
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-        for region in self.common.mmio_regions.iter_mut() {
-            let region_flags = self.device.get_region_flags(region.index);
-            if region_flags & VFIO_REGION_INFO_FLAG_MMAP != 0 {
-                let mut prot = 0;
-                if region_flags & VFIO_REGION_INFO_FLAG_READ != 0 {
-                    prot |= libc::PROT_READ;
-                }
-                if region_flags & VFIO_REGION_INFO_FLAG_WRITE != 0 {
-                    prot |= libc::PROT_WRITE;
-                }
+        for region_index in 0..self.common.mmio_regions.len() {
+            let bar_index = self.common.mmio_regions[region_index].index;
+            let region_flags = self.device.get_region_flags(bar_index);
+            if region_flags & VFIO_REGION_INFO_FLAG_MMAP == 0 {
+                continue;
+            }
 
-                // Retrieve the list of capabilities found on the region
-                let caps = if region_flags & VFIO_REGION_INFO_FLAG_CAPS != 0 {
-                    self.device.get_region_caps(region.index)
-                } else {
-                    Vec::new()
-                };
+            let mut prot = 0;
+            if region_flags & VFIO_REGION_INFO_FLAG_READ != 0 {
+                prot |= libc::PROT_READ;
+            }
+            if region_flags & VFIO_REGION_INFO_FLAG_WRITE != 0 {
+                prot |= libc::PROT_WRITE;
+            }
 
-                // Don't try to mmap the region if it contains MSI-X table or
-                // MSI-X PBA subregion, and if we couldn't find MSIX_MAPPABLE
-                // in the list of supported capabilities.
-                if let Some(msix) = self.common.interrupt.msix.as_ref()
-                    && (region.index == msix.cap.table_bir() || region.index == msix.cap.pba_bir())
-                    && !caps.contains(&VfioRegionInfoCap::MsixMappable)
-                {
-                    continue;
-                }
+            // Retrieve the list of capabilities found on the region
+            let caps = if region_flags & VFIO_REGION_INFO_FLAG_CAPS != 0 {
+                self.device.get_region_caps(bar_index)
+            } else {
+                Vec::new()
+            };
 
-                let mmap_size = self.device.get_region_size(region.index);
-                let mmap_offset = self.device.get_region_offset(region.index);
+            // Don't try to mmap the region if it contains MSI-X table or
+            // MSI-X PBA subregion, and if we couldn't find MSIX_MAPPABLE
+            // in the list of supported capabilities.
+            if let Some(msix) = self.common.interrupt.msix.as_ref()
+                && (bar_index == msix.cap.table_bir() || bar_index == msix.cap.pba_bir())
+                && !caps.contains(&VfioRegionInfoCap::MsixMappable)
+            {
+                continue;
+            }
 
-                let sparse_areas = Self::generate_sparse_areas(
-                    &caps,
-                    region.index,
-                    region.start.0,
-                    mmap_size,
-                    self.common.interrupt.msix.as_ref(),
-                )?;
+            let mmap_size = self.device.get_region_size(bar_index);
+            let mmap_offset = self.device.get_region_offset(bar_index);
 
-                let page_size = get_page_size();
-                for area in sparse_areas.iter() {
-                    // KVM_SET_USER_MEMORY_REGION requires memory_size to be a
-                    // multiple of the host page size. On aarch64 with 64K pages
-                    // a device BAR can be smaller than a page (e.g. 16K NVMe
-                    // BAR).
-                    //
-                    // The kernel only sets VFIO_REGION_INFO_FLAG_MMAP on sub-page
-                    // BARs after verifying the physical BAR start is page-aligned
-                    // and reserving the rest of the page. Expansion is only safe
-                    // at offset 0 where the kernel reservation applies.
-                    //
-                    // fixup_msix_region() ensures MSI-X relocation at >= page_size
-                    // offset, so the expanded mmap cannot overlap the trap region.
-                    let mmap_len = if area.size < page_size {
-                        if area.offset != 0 {
-                            error!(
-                                "BAR {}: sub-page sparse area at non-zero offset 0x{:x} \
-                                 cannot be safely expanded to page size",
-                                region.index, area.offset,
-                            );
-                            return Err(VfioPciError::MmapArea);
-                        }
-                        info!(
-                            "BAR {}: expanding sub-page sparse area mmap from 0x{:x} to \
-                             page size 0x{:x}",
-                            region.index, area.size, page_size,
-                        );
-                        page_size
-                    } else {
-                        area.size
-                    };
-                    let mapping = match MmapRegion::mmap(
-                        mmap_len,
-                        prot,
-                        fd,
-                        mmap_offset,
-                        area.offset,
-                    ) {
-                        Ok(mapping) => mapping,
-                        Err(_) => {
-                            error!(
-                                "Could not mmap sparse area (offset = 0x{:x}, size = 0x{:x}): {}",
-                                mmap_offset,
-                                mmap_len,
-                                std::io::Error::last_os_error()
-                            );
-                            return Err(VfioPciError::MmapArea);
-                        }
-                    };
+            let sparse_areas = Self::generate_sparse_areas(
+                &caps,
+                bar_index,
+                self.common.mmio_regions[region_index].start.0,
+                mmap_size,
+                self.common.interrupt.msix.as_ref(),
+            )?;
 
-                    let user_memory_region = UserMemoryRegion {
-                        slot: self.memory_slot_allocator.next_memory_slot(),
-                        start: region.start.0 + area.offset,
-                        mapping: Arc::new(mapping),
-                    };
-                    // SAFETY: MmapRegion invariants guarantee that
-                    // user_memory_region.mapping.addr() points to
-                    // user_memory_region.mapping.len() bytes of
-                    // valid memory that will only be unmapped with munmap().
-                    unsafe {
-                        self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                            false,
-                        )
-                    }
-                    .map_err(VfioPciError::CreateUserMemoryRegion)?;
-
-                    // Map the MMIO BAR into the host IOMMU address space via VfioOps
-                    // Only needed if p2p_dma is enabled.
-                    if !self.iommu_attached && self.p2p_dma {
-                        // vfio_dma_map should be unsafe but isn't.
-                        #[allow(unused_unsafe)]
-                        // SAFETY: MmapRegion invariants guarantee that
-                        // user_memory_region.mapping.addr() points to
-                        // user_memory_region.mapping.len() bytes of
-                        // valid memory that will only be unmapped with munmap().
-                        unsafe {
-                            self.vfio_ops.vfio_dma_map(
-                                user_memory_region.start,
-                                user_memory_region.mapping.len(),
-                                user_memory_region.mapping.addr(),
-                            )
-                        }
-                        .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))?;
-                    }
-                    region.user_memory_regions.push(user_memory_region);
-                }
+            for area in sparse_areas.iter() {
+                self.install_user_memory_region(region_index, area, prot, mmap_offset, fd)?;
             }
         }
 
+        Ok(())
+    }
+
+    fn install_user_memory_region(
+        &mut self,
+        region_index: usize,
+        area: &VfioRegionSparseMmapArea,
+        prot: i32,
+        mmap_offset: u64,
+        fd: BorrowedFd<'_>,
+    ) -> Result<(), VfioPciError> {
+        let region_start = self.common.mmio_regions[region_index].start.0;
+        let bar_index = self.common.mmio_regions[region_index].index;
+
+        // KVM_SET_USER_MEMORY_REGION requires memory_size to be a multiple of
+        // the host page size. On aarch64 with 64K pages a device BAR can be
+        // smaller than a page (e.g. 16K NVMe BAR).
+        //
+        // The kernel only sets VFIO_REGION_INFO_FLAG_MMAP on sub-page BARs
+        // after verifying the physical BAR start is page-aligned and reserving
+        // the rest of the page. Expansion is only safe at offset 0 where the
+        // kernel reservation applies.
+        //
+        // fixup_msix_region() ensures MSI-X relocation at >= page_size offset,
+        // so the expanded mmap cannot overlap the trap region.
+        let page_size = get_page_size();
+        let mmap_len = if area.size < page_size {
+            if area.offset != 0 {
+                error!(
+                    "BAR {bar_index}: sub-page sparse area at non-zero offset 0x{:x} \
+                     cannot be safely expanded to page size",
+                    area.offset,
+                );
+                return Err(VfioPciError::MmapArea);
+            }
+            info!(
+                "BAR {bar_index}: expanding sub-page sparse area mmap from 0x{:x} to \
+                 page size 0x{:x}",
+                area.size, page_size,
+            );
+            page_size
+        } else {
+            area.size
+        };
+
+        let mapping =
+            MmapRegion::mmap(mmap_len, prot, fd, mmap_offset, area.offset).map_err(|_| {
+                error!(
+                    "Could not mmap sparse area (offset = 0x{:x}, size = 0x{:x}): {}",
+                    mmap_offset,
+                    mmap_len,
+                    std::io::Error::last_os_error()
+                );
+                VfioPciError::MmapArea
+            })?;
+
+        let user_memory_region = UserMemoryRegion {
+            slot: self.memory_slot_allocator.next_memory_slot(),
+            start: region_start + area.offset,
+            mapping: Arc::new(mapping),
+        };
+        // SAFETY: MmapRegion invariants guarantee that
+        // user_memory_region.mapping.addr() points to
+        // user_memory_region.mapping.len() bytes of
+        // valid memory that will only be unmapped with munmap().
+        unsafe {
+            self.vm.create_user_memory_region(
+                user_memory_region.slot,
+                user_memory_region.start,
+                user_memory_region.mapping.len(),
+                user_memory_region.mapping.addr(),
+                false,
+                false,
+            )
+        }
+        .map_err(VfioPciError::CreateUserMemoryRegion)?;
+
+        // Map the MMIO BAR into the host IOMMU address space via VfioOps.
+        // Only needed if p2p_dma is enabled.
+        if !self.iommu_attached && self.p2p_dma {
+            // vfio_dma_map should be unsafe but isn't.
+            #[allow(unused_unsafe)]
+            // SAFETY: MmapRegion invariants guarantee that
+            // user_memory_region.mapping.addr() points to
+            // user_memory_region.mapping.len() bytes of
+            // valid memory that will only be unmapped with munmap().
+            unsafe {
+                self.vfio_ops.vfio_dma_map(
+                    user_memory_region.start,
+                    user_memory_region.mapping.len(),
+                    user_memory_region.mapping.addr(),
+                )
+            }
+            .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))?;
+        }
+
+        self.common.mmio_regions[region_index]
+            .user_memory_regions
+            .push(user_memory_region);
         Ok(())
     }
 
