@@ -1768,6 +1768,13 @@ impl VfioPciDevice {
         user_memory_regions.push(pending);
         let umr_index = user_memory_regions.len() - 1;
 
+        // Defer the host mmap and KVM memslot install until the guest first
+        // touches this sub-region. p2p_dma needs the host VA at attach time
+        // so that the IOMMU mapping covers it, so install eagerly in that
+        // case.
+        if self.iommu_attached || !self.p2p_dma {
+            return Ok(());
+        }
         self.install_pending_region(region_index, umr_index, fd)
     }
 
