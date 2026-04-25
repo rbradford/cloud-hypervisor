@@ -1202,8 +1202,12 @@ impl PciDevice for VirtioPciDevice {
             }
             o if (ISR_CONFIG_BAR_OFFSET..ISR_CONFIG_BAR_OFFSET + ISR_CONFIG_SIZE).contains(&o) => {
                 if let Some(v) = data.first() {
+                    // ISR is byte-wide; only the low 8 bits of
+                    // interrupt_status are guest-visible. Without the
+                    // !0xff mask the complement would also clear every
+                    // high bit on each ack.
                     self.interrupt_status
-                        .fetch_and(!(*v as usize), Ordering::AcqRel);
+                        .fetch_and(!(*v as usize) | !0xffusize, Ordering::AcqRel);
                 }
             }
             o if (DEVICE_CONFIG_BAR_OFFSET..DEVICE_CONFIG_BAR_OFFSET + DEVICE_CONFIG_SIZE)
