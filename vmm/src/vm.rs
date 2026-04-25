@@ -470,11 +470,7 @@ impl VmOps for VmOpsHandler {
             Err(vm_device::BusError::MissingAddressRange) => {
                 info!("Guest MMIO write to unregistered address 0x{gpa:x}");
             }
-            Ok(Some(barrier)) => {
-                info!("Waiting for barrier");
-                barrier.wait();
-                info!("Barrier released");
-            }
+            Ok(Some(barrier)) => wait_for_device_barrier("MMIO", barrier),
             _ => {}
         }
         Ok(())
@@ -494,14 +490,42 @@ impl VmOps for VmOpsHandler {
             Err(vm_device::BusError::MissingAddressRange) => {
                 info!("Guest PIO write to unregistered address 0x{port:x}");
             }
-            Ok(Some(barrier)) => {
-                info!("Waiting for barrier");
-                barrier.wait();
-                info!("Barrier released");
-            }
+            Ok(Some(barrier)) => wait_for_device_barrier("PIO", barrier),
             _ => {}
         }
         Ok(())
+    }
+}
+
+/// Wait on a device-supplied activation barrier with a hard cap.
+///
+/// `std::sync::Barrier::wait` has no timeout, so the wait is offloaded to a
+/// helper thread that signals a sync_channel when it returns. The vCPU
+/// thread blocks on `recv_timeout`, which wakes immediately on signal —
+/// activations that complete in microseconds remain microsecond-fast.
+///
+/// On timeout the helper thread is *not* joined: it stays parked on the
+/// barrier (the producer side never showed up — that's the broken state
+/// the timeout exists to escape). Letting it leak is the accepted cost of
+/// keeping the vCPU thread responsive.
+fn wait_for_device_barrier(label: &'static str, barrier: Arc<std::sync::Barrier>) {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+
+    info!("{label}: waiting for device activation barrier");
+    let (tx, rx) = mpsc::sync_channel::<()>(0);
+    std::thread::spawn(move || {
+        barrier.wait();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(BARRIER_TIMEOUT) {
+        Ok(()) => info!("{label}: device activation barrier released"),
+        Err(_) => error!(
+            "{label}: device activation barrier still pending after {}s; abandoning helper",
+            BARRIER_TIMEOUT.as_secs()
+        ),
     }
 }
 
