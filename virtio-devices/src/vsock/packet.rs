@@ -175,6 +175,14 @@ impl VsockPacket {
         // For small packets, the data may be stored in the same descriptor as the header.
         if !head.has_next() {
             let buf_size: usize = head.len() as usize - VSOCK_PKT_HDR_SIZE;
+            // The data buffer carved out of the head descriptor must be
+            // large enough to hold the packet body advertised by the
+            // header. The multi-descriptor branches enforce this at
+            // lines below; mirror that check here so a malformed chain
+            // cannot cause the consumer to slice past the buffer.
+            if (pkt.len() as usize) > buf_size {
+                return Err(VsockError::BufDescTooSmall);
+            }
             let buf_ptr = get_host_address_range(
                 desc_chain.memory(),
                 head.addr()
