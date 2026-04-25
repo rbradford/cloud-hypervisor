@@ -774,7 +774,24 @@ impl PciConfiguration {
             }
             p.bar_idx.is_some()
         });
+        for param in mem::take(&mut self.pending_bar_reprogram) {
+            self.queue_bar_reprogram(param);
+        }
         self
+    }
+
+    fn queue_bar_reprogram(&mut self, param: BarReprogrammingParams) {
+        if let Some(pending) = self
+            .pending_bar_reprogram
+            .iter_mut()
+            .find(|pending| pending.bar_idx == param.bar_idx)
+        {
+            // Keep the mapped address until decoding is enabled; intermediate
+            // register writes have not moved the BAR on the bus yet.
+            pending.new_base = param.new_base;
+        } else {
+            self.pending_bar_reprogram.push(param);
+        }
     }
 
     fn find_bar_idx_by_addr(&self, base_addr: u64, region_type: PciBarRegionType) -> Option<usize> {
@@ -1093,7 +1110,7 @@ impl PciConfiguration {
         }
 
         if let Some(param) = self.detect_bar_reprogramming(reg_idx, data) {
-            self.pending_bar_reprogram.push(param);
+            self.queue_bar_reprogram(param);
         }
 
         if !self.pending_bar_reprogram.is_empty() {
@@ -1883,13 +1900,91 @@ mod tests {
         cfg.write_config_register(BAR0_REG + 1, 0, &0xe000_0000u32.to_le_bytes());
         cfg.write_config_register(BAR0_REG + 1, 0, &0xf000_0000u32.to_le_bytes());
 
-        let pending = restore_legacy(&cfg);
+        // Older snapshots can contain a chain of moves without BAR indices.
+        let mut state = cfg.state();
+        let mut first = state.pending_bar_reprogram[0];
+        first.bar_idx = None;
+        first.new_base = 0xe000_0000;
+        let mut second = first;
+        second.old_base = first.new_base;
+        second.new_base = 0xf000_0000;
+        state.pending_bar_reprogram = vec![first, second];
+        let pending = reloc_config(Some(state)).pending_bar_reprogram;
 
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].bar_idx, Some(1));
-        assert_eq!(pending[0].new_base, 0xe000_0000);
-        assert_eq!(pending[1].bar_idx, Some(1));
-        assert_eq!(pending[1].new_base, 0xf000_0000);
+        assert_eq!(pending[0].old_base, 0xd000_0000);
+        assert_eq!(pending[0].new_base, 0xf000_0000);
+    }
+
+    #[test]
+    fn repeated_bar_writes_preserve_mapped_addresses() {
+        let mut cfg = reloc_config(None);
+        add_reloc_bar(&mut cfg, 0, 0xc000_0000);
+        add_reloc_bar(&mut cfg, 1, 0xd000_0000);
+        cfg.write_reg(COMMAND_REG, 0);
+
+        for i in 1..=128u32 {
+            for idx in 0..2 {
+                let addr = 0xe000_0000 + idx as u32 * 0x1000_0000 + i * RELOC_BAR_SIZE as u32;
+                assert!(
+                    cfg.write_config_register(BAR0_REG + idx, 0, &addr.to_le_bytes())
+                        .is_empty()
+                );
+            }
+            assert_eq!(cfg.pending_bar_reprogram.len(), 2);
+        }
+
+        let pending =
+            cfg.write_config_register(COMMAND_REG, 0, &COMMAND_REG_MEMORY_SPACE_MASK.to_le_bytes());
+        assert_eq!(pending.len(), 2);
+        for (idx, param) in pending.iter().enumerate() {
+            assert_eq!(param.bar_idx, Some(idx));
+            assert_eq!(param.old_base, 0xc000_0000 + idx as u64 * 0x1000_0000);
+            assert_eq!(param.new_base, cfg.get_bar_addr(idx));
+            cfg.restore_bar_addr(param);
+            assert_eq!(cfg.get_bar_addr(idx), param.old_base);
+        }
+        assert!(cfg.pending_bar_reprogram.is_empty());
+    }
+
+    #[test]
+    fn repeated_64bit_and_rom_bar_writes_are_coalesced() {
+        let mut cfg = reloc_config(None);
+        let bar = PciBarConfiguration::new(
+            0,
+            RELOC_BAR_SIZE,
+            PciBarRegionType::Memory64BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0x4_0000_0000);
+        cfg.add_pci_bar(&bar).unwrap();
+        let rom = PciBarConfiguration::new(
+            ROM_BAR_IDX,
+            RELOC_BAR_SIZE,
+            PciBarRegionType::Memory32BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0xc000_0000);
+        cfg.add_pci_rom_bar(&rom, 1).unwrap();
+        cfg.write_reg(COMMAND_REG, 0);
+
+        for i in 1..=128u32 {
+            cfg.write_config_register(BAR0_REG, 0, &(i * RELOC_BAR_SIZE as u32).to_le_bytes());
+            cfg.write_config_register(BAR0_REG + 1, 0, &8u32.to_le_bytes());
+            let addr = 0xd000_0000 + i * RELOC_BAR_SIZE as u32;
+            cfg.write_config_register(ROM_BAR_REG, 0, &addr.to_le_bytes());
+            assert_eq!(cfg.pending_bar_reprogram.len(), 2);
+        }
+
+        let pending =
+            cfg.write_config_register(COMMAND_REG, 0, &COMMAND_REG_MEMORY_SPACE_MASK.to_le_bytes());
+        assert_eq!(pending[0].bar_idx, Some(0));
+        assert_eq!(pending[0].old_base, 0x4_0000_0000);
+        assert_eq!(pending[0].new_base, 0x8_0000_0000 + 128 * RELOC_BAR_SIZE);
+        assert_eq!(pending[1].bar_idx, Some(ROM_BAR_IDX));
+        assert_eq!(pending[1].old_base, 0xc000_0000);
+        assert_eq!(pending[1].new_base, 0xd000_0000 + 128 * RELOC_BAR_SIZE);
     }
 
     #[test]
