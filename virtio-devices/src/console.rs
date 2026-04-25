@@ -12,12 +12,12 @@ use std::{cmp, io, result};
 use anyhow::anyhow;
 use event_monitor::event;
 use libc::{EFD_NONBLOCK, TIOCGWINSZ};
-use log::{error, info};
+use log::{error, info, warn};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use serial_buffer::SerialBuffer;
 use thiserror::Error;
-use virtio_queue::{Queue, QueueT};
+use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::{AccessPlatform, Translatable};
@@ -255,24 +255,53 @@ impl ConsoleEpollHandler {
         let trans_queue = &mut self.output_queue; //transmitq
         let mut used_descs = false;
 
+        // The console output backend (PTY, file, ...) sees every byte the
+        // guest writes verbatim. Cap the bytes the device will copy out of
+        // a single descriptor so a buggy or hostile guest cannot fill the
+        // host disk / log volume with one giant descriptor, and cap the
+        // total bytes per invocation so the guest cannot achieve the same
+        // result by chaining many smaller descriptors back-to-back.
+        const MAX_OUTPUT_BYTES_PER_DESC: usize = 1 << 20;
+        const MAX_OUTPUT_BYTES_PER_CALL: usize = 16 << 20;
+        let mut bytes_this_call: usize = 0;
+
         while let Some(mut desc_chain) = trans_queue.pop_descriptor_chain(self.mem.memory()) {
+            if bytes_this_call >= MAX_OUTPUT_BYTES_PER_CALL {
+                warn!(
+                    "Stopping console output processing after {bytes_this_call} bytes; \
+                     re-arm next epoll round"
+                );
+                trans_queue.go_to_previous_position();
+                break;
+            }
             while let Some(desc) = desc_chain.next() {
                 if let Some(out) = &mut self.out {
+                    let mut len = std::cmp::min(desc.len() as usize, MAX_OUTPUT_BYTES_PER_DESC);
+                    let remaining = MAX_OUTPUT_BYTES_PER_CALL.saturating_sub(bytes_this_call);
+                    len = std::cmp::min(len, remaining);
+                    if len < desc.len() as usize {
+                        warn!(
+                            "Truncating console output descriptor from {} to {} bytes",
+                            desc.len(),
+                            len
+                        );
+                    }
                     let mut buf: Vec<u8> = Vec::new();
                     desc_chain
                         .memory()
                         .write_volatile_to(
                             desc.addr()
-                                .translate_gva(self.access_platform.as_deref(), desc.len() as usize)
+                                .translate_gva(self.access_platform.as_deref(), len)
                                 .map_err(|e| {
                                     Error::GuestMemoryRead(vm_memory::GuestMemoryError::IOError(e))
                                 })?,
                             &mut buf,
-                            desc.len() as usize,
+                            len,
                         )
                         .map_err(Error::GuestMemoryRead)?;
 
                     out.write_all(&buf).map_err(Error::OutputWriteAll)?;
+                    bytes_this_call = bytes_this_call.saturating_add(len);
                 }
             }
             trans_queue
