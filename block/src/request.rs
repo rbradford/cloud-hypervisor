@@ -105,9 +105,15 @@ impl Request {
             return Err(Error::UnexpectedWriteOnlyDescriptor);
         }
 
+        // Only the type (offset 0, u32) and the sector (offset 8, u64) are
+        // ever read from the head descriptor — translate exactly those 16
+        // bytes through the IOMMU rather than the full descriptor length, so
+        // an oversized descriptor whose tail isn't IOMMU-mapped doesn't
+        // falsely fail an otherwise-valid request.
+        const VIRTIO_BLK_REQ_HDR_SIZE: usize = 16;
         let hdr_desc_addr = hdr_desc
             .addr()
-            .translate_gva(access_platform, hdr_desc.len() as usize)
+            .translate_gva(access_platform, VIRTIO_BLK_REQ_HDR_SIZE)
             .map_err(|e| Error::GuestMemory(GuestMemoryError::IOError(e)))?;
 
         let mut req = Request {
@@ -179,9 +185,12 @@ impl Request {
             return Err(Error::DescriptorLengthTooSmall);
         }
 
+        // Only the first byte of the status descriptor is written by the
+        // device; translate just that one byte rather than the full
+        // descriptor length.
         req.status_addr = status_desc
             .addr()
-            .translate_gva(access_platform, status_desc.len() as usize)
+            .translate_gva(access_platform, 1)
             .map_err(|e| Error::GuestMemory(GuestMemoryError::IOError(e)))?;
 
         Ok(req)
