@@ -188,3 +188,6 @@ impl From<&str> for PciBdf {
         Self::from_str(bdf).unwrap()
     }
 }
+
+#[cfg(test)]
+mod test_util;

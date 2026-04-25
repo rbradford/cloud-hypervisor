@@ -204,7 +204,7 @@ impl VfioMsix {
     fn update(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
         let old_enabled = self.bar.enabled();
 
-        // Update "Message Control" word
+        // MSI-X enable and function mask are both in byte 3 of the capability.
         if offset == 2 && data.len() == 2 {
             let data = LittleEndian::read_u16(data);
             self.bar.set_msg_ctl(data);
@@ -212,6 +212,10 @@ impl VfioMsix {
         } else if offset == 0 && data.len() == 4 {
             // Some guests update MSI-X control through the dword config write path.
             let data = (LittleEndian::read_u32(data) >> 16) as u16;
+            self.bar.set_msg_ctl(data);
+            self.cap.set_msg_ctl(data);
+        } else if offset == 3 && data.len() == 1 {
+            let data = u16::from(data[0]) << 8;
             self.bar.set_msg_ctl(data);
             self.cap.set_msg_ctl(data);
         }
@@ -3073,6 +3077,36 @@ mod tests {
 
     use super::*;
     use crate::PasidCap;
+    use crate::test_util::{TestInterruptSourceGroup, msix_config};
+
+    #[test]
+    fn partial_msix_control_writes_update_vfio_state() {
+        let source = Arc::new(TestInterruptSourceGroup);
+        let mut msix = VfioMsix {
+            bar: msix_config(),
+            cap: MsixCap::new(0, 1, 0, 0, 0),
+            cap_offset: 0,
+            interrupt_source_group: source,
+        };
+
+        assert!(matches!(
+            msix.update(3, &[0x80]),
+            Some(InterruptUpdateAction::EnableMsix)
+        ));
+        assert!(msix.bar.enabled());
+        assert!(msix.cap.enabled());
+        assert!(msix.update(3, &[0xc0]).is_none());
+        assert!(msix.bar.masked());
+        assert!(msix.cap.masked());
+        assert!(msix.update(2, &[0xff]).is_none());
+        assert_eq!(msix.cap.table_size(), 1);
+        assert!(matches!(
+            msix.update(3, &[0]),
+            Some(InterruptUpdateAction::DisableMsix)
+        ));
+        assert!(!msix.bar.enabled());
+        assert!(!msix.cap.enabled());
+    }
 
     fn sparse_mmio_regions() -> Vec<MmioRegion> {
         let page_size = get_page_size();
