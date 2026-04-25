@@ -352,15 +352,22 @@ impl BusDevice for Tpm {
         let mut offset: u32 = offset as u32;
         let read_len: usize = data.len();
 
-        if offset >= CRB_DATA_BUFFER
-            && (offset + read_len as u32) < (CRB_DATA_BUFFER + self.data_buff.len() as u32)
-        {
+        let in_data_buffer = offset >= CRB_DATA_BUFFER
+            && (offset as usize)
+                .checked_add(read_len)
+                .is_some_and(|end| end <= (CRB_DATA_BUFFER as usize) + self.data_buff.len());
+
+        if in_data_buffer {
             // Read from Data Buffer
             let start: usize = (offset as usize) - (CRB_DATA_BUFFER as usize);
             let end: usize = start + read_len;
             data[..].clone_from_slice(&self.data_buff[start..end]);
         } else {
             offset &= 0xff;
+            if (offset as usize) >= self.regs.len() {
+                error!("Invalid tpm read: offset {offset:#X} outside register range");
+                return;
+            }
             let mut val = self.regs[offset as usize];
 
             if offset == CRB_LOC_STATE && !self.emulator.get_established_flag() {
@@ -399,9 +406,12 @@ impl BusDevice for Tpm {
         let locality = locality_from_addr(offset) as u32;
         let write_len = data.len();
 
-        if offset >= CRB_DATA_BUFFER
-            && (offset + write_len as u32) < (CRB_DATA_BUFFER + self.data_buff.len() as u32)
-        {
+        let in_data_buffer = offset >= CRB_DATA_BUFFER
+            && (offset as usize)
+                .checked_add(write_len)
+                .is_some_and(|end| end <= (CRB_DATA_BUFFER as usize) + self.data_buff.len());
+
+        if in_data_buffer {
             let start: usize = (offset as usize) - (CRB_DATA_BUFFER as usize);
             if start == 0 {
                 // If filling data_buff at index 0, reset length to 0
@@ -420,6 +430,13 @@ impl BusDevice for Tpm {
                     offset,
                     data.len()
                 );
+                return None;
+            }
+            // The control register dispatch below unconditionally consumes 4
+            // bytes; reject narrower writes rather than panicking on the
+            // copy_from_slice.
+            if write_len < 4 {
+                error!("Invalid tpm write: offset {offset:#X}, data length {write_len} too small");
                 return None;
             }
 
