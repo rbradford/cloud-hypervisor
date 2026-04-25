@@ -1026,6 +1026,7 @@ impl PciConfiguration {
                     region_type,
                 });
             } else if (reg_idx > BAR0_REG)
+                && self.bars[bar_idx - 1].r#type == Some(PciBarRegionType::Memory64BitRegion)
                 && ((self.registers[reg_idx - 1] & self.writable_bits[reg_idx - 1])
                     != (self.bars[bar_idx - 1].addr & self.writable_bits[reg_idx - 1])
                     || (value & mask) != (self.bars[bar_idx].addr & mask))
