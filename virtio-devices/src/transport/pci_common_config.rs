@@ -249,7 +249,17 @@ impl VirtioPciCommonConfig {
         match offset {
             0x10 => self.msix_config.store(value, Ordering::Release),
             0x16 => self.queue_select = value,
-            0x18 => self.with_queue_mut(queues, |q| q.set_size(value)),
+            0x18 => self.with_queue_mut(queues, |q| {
+                if q.ready() {
+                    warn!("attempt to set queue size while queue is ready");
+                    return;
+                }
+                if value == 0 || value > q.max_size() || !value.is_power_of_two() {
+                    warn!("attempt to set invalid queue size {value}");
+                    return;
+                }
+                q.set_size(value);
+            }),
             0x1a => {
                 if let Some(entry) = self
                     .msix_queues
@@ -352,12 +362,24 @@ impl VirtioPciCommonConfig {
                         .ack_features(u64::from(value) << (self.driver_feature_select * 32));
                 }
             }
-            0x20 => self.with_queue_mut(queues, |q| q.set_desc_table_address(Some(value), None)),
-            0x24 => self.with_queue_mut(queues, |q| q.set_desc_table_address(None, Some(value))),
-            0x28 => self.with_queue_mut(queues, |q| q.set_avail_ring_address(Some(value), None)),
-            0x2c => self.with_queue_mut(queues, |q| q.set_avail_ring_address(None, Some(value))),
-            0x30 => self.with_queue_mut(queues, |q| q.set_used_ring_address(Some(value), None)),
-            0x34 => self.with_queue_mut(queues, |q| q.set_used_ring_address(None, Some(value))),
+            0x20 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_desc_table_address(Some(value), None);
+            }),
+            0x24 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_desc_table_address(None, Some(value));
+            }),
+            0x28 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_avail_ring_address(Some(value), None);
+            }),
+            0x2c => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_avail_ring_address(None, Some(value));
+            }),
+            0x30 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_used_ring_address(Some(value), None);
+            }),
+            0x34 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_used_ring_address(None, Some(value));
+            }),
             _ => {
                 warn!("invalid virtio register dword write: 0x{offset:x}");
             }
@@ -376,9 +398,15 @@ impl VirtioPciCommonConfig {
         let high = Some((value >> 32) as u32);
 
         match offset {
-            0x20 => self.with_queue_mut(queues, |q| q.set_desc_table_address(low, high)),
-            0x28 => self.with_queue_mut(queues, |q| q.set_avail_ring_address(low, high)),
-            0x30 => self.with_queue_mut(queues, |q| q.set_used_ring_address(low, high)),
+            0x20 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_desc_table_address(low, high);
+            }),
+            0x28 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_avail_ring_address(low, high);
+            }),
+            0x30 => self.with_queue_mut_pre_ready(queues, offset, |q| {
+                q.set_used_ring_address(low, high);
+            }),
             _ => {
                 warn!("invalid virtio register qword write: 0x{offset:x}");
             }
@@ -394,6 +422,27 @@ impl VirtioPciCommonConfig {
 
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&self, queues: &mut [Queue], f: F) {
         if let Some(queue) = queues.get_mut(self.queue_select as usize) {
+            f(queue);
+        }
+    }
+
+    /// Like `with_queue_mut`, but also rejects writes to fields that the
+    /// virtio spec requires to be set before `queue_enable`. Forwarding such
+    /// writes to a queue whose worker is already operating on the previous
+    /// values lets a guest redirect descriptor / ring addresses mid-flight.
+    fn with_queue_mut_pre_ready<F: FnOnce(&mut Queue)>(
+        &self,
+        queues: &mut [Queue],
+        offset: u64,
+        f: F,
+    ) {
+        if let Some(queue) = queues.get_mut(self.queue_select as usize) {
+            if queue.ready() {
+                warn!(
+                    "ignoring write at offset 0x{offset:x}: queue is already ready"
+                );
+                return;
+            }
             f(queue);
         }
     }
