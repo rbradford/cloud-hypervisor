@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use anyhow::anyhow;
 use event_monitor::event;
-use log::{error, info};
+use log::{error, info, warn};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -52,12 +52,8 @@ const WATCHDOG_TIMEOUT: u64 = WATCHDOG_TIMER_INTERVAL as u64 + 5;
 enum Error {
     #[error("Error programming timer fd")]
     TimerfdSetup(#[source] io::Error),
-    #[error("Descriptor chain too short")]
-    DescriptorChainTooShort,
     #[error("Failed adding used index")]
     QueueAddUsed(#[source] virtio_queue::Error),
-    #[error("Invalid descriptor")]
-    InvalidDescriptor,
     #[error("Failed to write to guest memory")]
     GuestMemoryWrite(#[source] vm_memory::guest_memory::Error),
 }
@@ -81,10 +77,30 @@ impl WatchdogEpollHandler {
         let queue = &mut self.queue;
         let mut used_descs = false;
         while let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
-            let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
+            // A bad descriptor is a guest bug, not a VMM bug. Skip the
+            // chain (returning a zero-length used entry) instead of
+            // killing the worker thread, which would tear down the VMM
+            // via exit_evt.
+            let Some(desc) = desc_chain.next() else {
+                warn!("Empty watchdog descriptor chain");
+                queue
+                    .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                    .map_err(Error::QueueAddUsed)?;
+                used_descs = true;
+                continue;
+            };
 
             if !(desc.is_write_only() && desc.len() > 0) {
-                return Err(Error::InvalidDescriptor);
+                warn!(
+                    "Invalid watchdog descriptor: write_only={} len={}",
+                    desc.is_write_only(),
+                    desc.len()
+                );
+                queue
+                    .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                    .map_err(Error::QueueAddUsed)?;
+                used_descs = true;
+                continue;
             }
 
             desc_chain
