@@ -617,6 +617,15 @@ impl cpu::Vcpu for MshvVcpu {
                     let access_info = info.access_info;
                     // SAFETY: access_info is valid, otherwise we won't be here
                     let len = unsafe { access_info.__bindgen_anon_1.access_size() } as usize;
+                    // access_size is a guest-controlled 3-bit field; only
+                    // 1/2/4 are architecturally valid for PIO. Anything else
+                    // would either slice past the 4-byte buffer below or
+                    // make `32 - len * 8` underflow when masking the result.
+                    if !matches!(len, 1 | 2 | 4) {
+                        warn!("Invalid PIO access_size: {len}");
+                        self.advance_rip_update_rax(&info, info.rax)?;
+                        return Ok(cpu::VmExit::Ignore);
+                    }
                     let is_write = info.header.intercept_access_type == 1;
                     let port = info.port_number;
                     let mut data: [u8; 4] = [0; 4];
