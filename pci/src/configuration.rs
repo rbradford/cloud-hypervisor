@@ -942,6 +942,20 @@ impl PciConfiguration {
         }
 
         if let Some(param) = self.detect_bar_reprogramming(reg_idx, data) {
+            // Cap the queue. Without a cap a guest that issues BAR writes
+            // without ever flipping the MSE bit can grow this Vec without
+            // bound. Each entry's old_base is the prior entry's new_base,
+            // so dropping just the head leaves an incoherent partial chain
+            // that can't be safely applied. Discard the whole pending
+            // state and force the guest to reprogram from scratch.
+            const MAX_PENDING_BAR_REPROGRAM: usize = 64;
+            if self.pending_bar_reprogram.len() >= MAX_PENDING_BAR_REPROGRAM {
+                warn!(
+                    "pending_bar_reprogram queue full ({}); discarding all pending entries",
+                    self.pending_bar_reprogram.len()
+                );
+                self.pending_bar_reprogram.clear();
+            }
             self.pending_bar_reprogram.push(param);
         }
 
