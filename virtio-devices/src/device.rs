@@ -169,7 +169,7 @@ pub trait VirtioDevice: Send {
     fn read_config_from_slice(&self, config: &[u8], offset: u64, mut data: &mut [u8]) {
         let config_len = config.len() as u64;
         let data_len = data.len() as u64;
-        if offset + data_len > config_len {
+        let Some(end) = offset.checked_add(data_len).filter(|e| *e <= config_len) else {
             error!(
                 "Out-of-bound access to configuration: config_len = {} offset = {:x} length = {} for {}",
                 config_len,
@@ -178,11 +178,9 @@ pub trait VirtioDevice: Send {
                 self.device_type()
             );
             return;
-        }
-        if let Some(end) = offset.checked_add(data.len() as u64) {
-            data.write_all(&config[offset as usize..std::cmp::min(end, config_len) as usize])
-                .unwrap();
-        }
+        };
+        data.write_all(&config[offset as usize..end as usize])
+            .unwrap();
     }
 
     /// Set the access platform trait to let the device perform address
