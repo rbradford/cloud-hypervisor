@@ -46,7 +46,9 @@ const PL011_FLAG_RXFE: u32 = 0x10;
 const PL011_ID: [u8; 8] = [0x11, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 // We are only interested in the margins.
 const AMBA_ID_LOW: u64 = 0x3f8;
-const AMBA_ID_HIGH: u64 = 0x401;
+// Exclusive upper bound: range AMBA_ID_LOW..AMBA_ID_HIGH must have exactly
+// PL011_ID.len() (8) entries so PL011_ID[index] cannot be out of bounds.
+const AMBA_ID_HIGH: u64 = 0x400;
 
 #[derive(Debug, Error)]
 pub enum Error {
