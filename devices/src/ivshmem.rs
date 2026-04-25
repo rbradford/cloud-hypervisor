@@ -335,6 +335,10 @@ impl PciDevice for IvshmemDevice {
         match bar_idx {
             // bar 0
             0 => {
+                if data.len() != 4 {
+                    warn!("Invalid sized read of ivshmem BAR0: {}", data.len());
+                    return;
+                }
                 // ivshmem don't use interrupt, we return zero now.
                 LittleEndian::write_u32(data, 0);
             }
