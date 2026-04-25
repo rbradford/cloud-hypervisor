@@ -156,7 +156,10 @@ impl VfioMsix {
     fn update(&mut self, offset: u64, data: &[u8]) -> Option<InterruptUpdateAction> {
         let old_enabled = self.bar.enabled();
 
-        // Update "Message Control" word
+        // Update "Message Control" word. set_msg_ctl only consumes bits
+        // 14/15 (function-mask and MSI-X enable), which both live in byte 3
+        // of the cap register. Catch every write width that touches that
+        // byte so the cache cannot desync from the device-side state.
         if offset == 2 && data.len() == 2 {
             let data = LittleEndian::read_u16(data);
             self.bar.set_msg_ctl(data);
@@ -164,6 +167,12 @@ impl VfioMsix {
         } else if offset == 0 && data.len() == 4 {
             // Some guests update MSI-X control through the dword config write path.
             let data = (LittleEndian::read_u32(data) >> 16) as u16;
+            self.bar.set_msg_ctl(data);
+            self.cap.set_msg_ctl(data);
+        } else if offset == 3 && data.len() == 1 {
+            // Single-byte write to byte 3 still updates mask/enable; the
+            // low byte of msg_ctl is ignored by set_msg_ctl.
+            let data = u16::from(data[0]) << 8;
             self.bar.set_msg_ctl(data);
             self.cap.set_msg_ctl(data);
         }

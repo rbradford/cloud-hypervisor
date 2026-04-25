@@ -914,23 +914,6 @@ impl PciConfiguration {
             return Vec::new();
         }
 
-        // Handle potential write to MSI-X message control register
-        if let Some(msix_cap_reg_idx) = self.msix_cap_reg_idx
-            && let Some(msix_config) = &self.msix_config
-        {
-            if msix_cap_reg_idx == reg_idx && offset == 2 && data.len() == 2 {
-                msix_config
-                    .lock()
-                    .unwrap()
-                    .set_msg_ctl(LittleEndian::read_u16(data));
-            } else if msix_cap_reg_idx == reg_idx && offset == 0 && data.len() == 4 {
-                msix_config
-                    .lock()
-                    .unwrap()
-                    .set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16);
-            }
-        }
-
         match data.len() {
             1 => self.write_byte(reg_idx * 4 + offset as usize, data[0]),
             2 => self.write_word(
@@ -939,6 +922,24 @@ impl PciConfiguration {
             ),
             4 => self.write_reg(reg_idx, LittleEndian::read_u32(data)),
             _ => (),
+        }
+
+        // Refresh the cached MSI-X message-control state if the write
+        // touched bytes 2 or 3 of the cap register, regardless of width.
+        // The previous code only handled 2-byte@2 and 4-byte@0 — single-byte
+        // writes silently desynced the cache from the device-side state.
+        if let Some(msix_cap_reg_idx) = self.msix_cap_reg_idx
+            && let Some(msix_config) = &self.msix_config
+            && msix_cap_reg_idx == reg_idx
+        {
+            let end = offset as usize + data.len();
+            if (offset as usize) < 4 && end > 2 {
+                let reg_val = self.registers[reg_idx];
+                msix_config
+                    .lock()
+                    .unwrap()
+                    .set_msg_ctl((reg_val >> 16) as u16);
+            }
         }
 
         if let Some(param) = self.detect_bar_reprogramming(reg_idx, data) {
