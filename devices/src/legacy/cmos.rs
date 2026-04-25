@@ -14,7 +14,7 @@ use std::{mem, thread};
 #[cfg_attr(target_env = "musl", allow(deprecated))]
 use libc::time_t;
 use libc::{CLOCK_REALTIME, clock_gettime, gmtime_r, timespec, tm};
-use log::{debug, info};
+use log::{debug, error, info};
 use vm_device::BusDevice;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -78,7 +78,10 @@ impl BusDevice for Cmos {
             DATA_OFFSET => {
                 if self.index == 0x8f && data[0] == 0 {
                     info!("CMOS reset");
-                    self.reset_evt.write(1).unwrap();
+                    if let Err(e) = self.reset_evt.write(1) {
+                        error!("CMOS: failed to signal reset_evt: {e}");
+                        return None;
+                    }
                     // Spin until we are sure the reset_evt has been handled and that when
                     // we return from the KVM_RUN we will exit rather than re-enter the guest.
                     while !self.vcpus_kill_signalled.load(Ordering::SeqCst) {
@@ -168,5 +171,21 @@ impl BusDevice for Cmos {
                 0
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_reset_signal_does_not_wait_for_vcpus() {
+        let reset_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        reset_evt.write(u64::MAX - 1).unwrap();
+        let mut cmos = Cmos::new(0, 0, reset_evt, Arc::new(AtomicBool::new(false)));
+
+        cmos.write(0, INDEX_OFFSET, &[0x8f]);
+        assert!(cmos.write(0, DATA_OFFSET, &[0]).is_none());
+        assert_eq!(cmos.reset_evt.read().unwrap(), u64::MAX - 1);
     }
 }
