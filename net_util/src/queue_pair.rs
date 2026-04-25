@@ -209,6 +209,15 @@ impl RxVirtio {
                 .next()
                 .ok_or(NetQueuePairError::DescriptorChainTooShort)?;
 
+            // The first descriptor must hold a complete virtio-net vnet
+            // header. The num_buffers offset (10) is only valid if the
+            // descriptor is large enough; without this check a guest could
+            // supply a 1-byte first descriptor and the device would later
+            // write num_buffers two bytes past the descriptor's end.
+            if (desc.len() as usize) < vnet_hdr_len() {
+                return Err(NetQueuePairError::DescriptorInvalidHeader);
+            }
+
             let num_buffers_addr = desc_chain
                 .memory()
                 .checked_offset(
