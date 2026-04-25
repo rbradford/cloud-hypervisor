@@ -65,13 +65,7 @@ impl BusDevice for AcpiShutdownDevice {
             if let Err(e) = self.reset_evt.write(1) {
                 error!("Error triggering ACPI reset event: {e}");
             }
-            // Spin until we are sure the reset_evt has been handled and that when
-            // we return from the KVM_RUN we will exit rather than re-enter the guest.
-            while !self.vcpus_kill_signalled.load(Ordering::SeqCst) {
-                // This is more effective than thread::yield_now() at
-                // avoiding a priority inversion with the VMM thread
-                thread::sleep(std::time::Duration::from_millis(1));
-            }
+            wait_for_kill_signal(&self.vcpus_kill_signalled, "ACPI Reboot");
         }
         // The ACPI DSDT table specifies the S5 sleep state (shutdown) as value 5
         const S5_SLEEP_VALUE: u8 = 5;
@@ -82,15 +76,30 @@ impl BusDevice for AcpiShutdownDevice {
             if let Err(e) = self.guest_exit_evt.write(1) {
                 error!("Error triggering ACPI shutdown event: {e}");
             }
-            // Spin until we are sure the reset_evt has been handled and that when
-            // we return from the KVM_RUN we will exit rather than re-enter the guest.
-            while !self.vcpus_kill_signalled.load(Ordering::SeqCst) {
-                // This is more effective than thread::yield_now() at
-                // avoiding a priority inversion with the VMM thread
-                thread::sleep(std::time::Duration::from_millis(1));
-            }
+            wait_for_kill_signal(&self.vcpus_kill_signalled, "ACPI Shutdown");
         }
         None
+    }
+}
+
+/// Wait until the vCPU kill signal is observed, with a hard cap to avoid
+/// pinning the dispatching vCPU thread forever if the supervising thread
+/// fails to deliver the signal (e.g. because the corresponding EventFd
+/// write failed).
+fn wait_for_kill_signal(vcpus_kill_signalled: &Arc<AtomicBool>, source: &str) {
+    const KILL_SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let start = Instant::now();
+    while !vcpus_kill_signalled.load(Ordering::SeqCst) {
+        if start.elapsed() > KILL_SIGNAL_TIMEOUT {
+            error!(
+                "{source}: vcpus_kill_signalled not observed within {}s; giving up",
+                KILL_SIGNAL_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        // This is more effective than thread::yield_now() at
+        // avoiding a priority inversion with the VMM thread
+        thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 

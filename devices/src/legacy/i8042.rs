@@ -48,9 +48,21 @@ impl BusDevice for I8042Device {
             if let Err(e) = self.reset_evt.write(1) {
                 error!("Error triggering i8042 reset event: {e}");
             }
-            // Spin until we are sure the reset_evt has been handled and that when
-            // we return from the KVM_RUN we will exit rather than re-enter the guest.
+            // Wait for the supervising thread to observe the reset_evt and
+            // tear down the vCPUs. Cap the wait so a missed reset_evt
+            // delivery cannot pin this vCPU thread (and the device mutex it
+            // holds) forever.
+            const KILL_SIGNAL_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(30);
+            let start = std::time::Instant::now();
             while !self.vcpus_kill_signalled.load(Ordering::SeqCst) {
+                if start.elapsed() > KILL_SIGNAL_TIMEOUT {
+                    error!(
+                        "i8042 reset: vcpus_kill_signalled not observed within {}s; giving up",
+                        KILL_SIGNAL_TIMEOUT.as_secs()
+                    );
+                    break;
+                }
                 // This is more effective than thread::yield_now() at
                 // avoiding a priority inversion with the VMM thread
                 thread::sleep(std::time::Duration::from_millis(1));
