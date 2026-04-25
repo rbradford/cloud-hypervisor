@@ -522,21 +522,23 @@ impl Request {
                         }
                     }
 
-                    // Add new mapping associated with the domain
-                    mapping
-                        .domains
-                        .write()
-                        .unwrap()
-                        .get_mut(&domain_id)
-                        .unwrap()
-                        .mappings
-                        .insert(
-                            req.virt_start,
-                            Mapping {
-                                gpa: req.phys_start,
-                                size,
-                            },
-                        );
+                    // Add new mapping associated with the domain. The domain
+                    // existence was checked above under a read lock and may
+                    // have been removed by a concurrent DETACH before we
+                    // acquired the write lock; treat that as an invalid
+                    // request rather than panicking.
+                    let mut domains = mapping.domains.write().unwrap();
+                    let Some(domain) = domains.get_mut(&domain_id) else {
+                        status = VIRTIO_IOMMU_S_INVAL;
+                        return Err(Error::InvalidMapRequestMissingDomain);
+                    };
+                    domain.mappings.insert(
+                        req.virt_start,
+                        Mapping {
+                            gpa: req.phys_start,
+                            size,
+                        },
+                    );
                 }
                 VIRTIO_IOMMU_T_UNMAP => {
                     if desc_size_left != size_of::<VirtioIommuReqUnmap>() {
@@ -599,13 +601,16 @@ impl Request {
                         }
                     }
 
-                    // Remove all mappings associated with the domain within the requested range
-                    mapping
-                        .domains
-                        .write()
-                        .unwrap()
-                        .get_mut(&domain_id)
-                        .unwrap()
+                    // Remove all mappings associated with the domain within
+                    // the requested range. As above, treat a domain that was
+                    // removed by a concurrent DETACH between the pre-check
+                    // and the write lock as an invalid request.
+                    let mut domains = mapping.domains.write().unwrap();
+                    let Some(domain) = domains.get_mut(&domain_id) else {
+                        status = VIRTIO_IOMMU_S_INVAL;
+                        return Err(Error::InvalidUnmapRequestMissingDomain);
+                    };
+                    domain
                         .mappings
                         .retain(|&x, _| x < req.virt_start || x > req.virt_end);
                 }
