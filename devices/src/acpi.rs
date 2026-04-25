@@ -77,6 +77,7 @@ impl BusDevice for AcpiShutdownDevice {
             info!("ACPI Reboot signalled");
             if let Err(e) = self.reset_evt.write(1) {
                 error!("Error triggering ACPI reset event: {e}");
+                return None;
             }
             // Spin until we are sure the reset_evt has been handled and that when
             // we return from the KVM_RUN we will exit rather than re-enter the guest.
@@ -94,6 +95,7 @@ impl BusDevice for AcpiShutdownDevice {
             info!("ACPI Shutdown signalled");
             if let Err(e) = self.guest_exit_evt.write(1) {
                 error!("Error triggering ACPI shutdown event: {e}");
+                return None;
             }
             // Spin until we are sure the reset_evt has been handled and that when
             // we return from the KVM_RUN we will exit rather than re-enter the guest.
@@ -356,6 +358,22 @@ impl BusDevice for AcpiPmTimerDevice {
 #[cfg(all(test, not(target_arch = "riscv64")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reset_and_shutdown_signals_do_not_wait_for_vcpus() {
+        for value in [1, 0x34] {
+            let reset_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let exit_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            reset_evt.write(u64::MAX - 1).unwrap();
+            exit_evt.write(u64::MAX - 1).unwrap();
+            let mut device =
+                AcpiShutdownDevice::new(exit_evt, reset_evt, Arc::new(AtomicBool::new(false)));
+
+            assert!(device.write(0, 0, &[value]).is_none());
+            assert_eq!(device.reset_evt.read().unwrap(), u64::MAX - 1);
+            assert_eq!(device.guest_exit_evt.read().unwrap(), u64::MAX - 1);
+        }
+    }
 
     #[test]
     fn test_vmgenid_regenerate() {

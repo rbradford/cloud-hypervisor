@@ -48,6 +48,7 @@ impl BusDevice for I8042Device {
             info!("i8042 reset signalled");
             if let Err(e) = self.reset_evt.write(1) {
                 error!("Error triggering i8042 reset event: {e}");
+                return None;
             }
             // Spin until we are sure the reset_evt has been handled and that when
             // we return from the KVM_RUN we will exit rather than re-enter the guest.
@@ -59,5 +60,20 @@ impl BusDevice for I8042Device {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_reset_signal_does_not_wait_for_vcpus() {
+        let reset_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        reset_evt.write(u64::MAX - 1).unwrap();
+        let mut device = I8042Device::new(reset_evt, Arc::new(AtomicBool::new(false)));
+
+        assert!(device.write(0, 3, &[0xfe]).is_none());
+        assert_eq!(device.reset_evt.read().unwrap(), u64::MAX - 1);
     }
 }
