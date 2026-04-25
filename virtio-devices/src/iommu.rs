@@ -835,8 +835,26 @@ pub struct IommuMapping {
 }
 
 impl DmaRemapping for IommuMapping {
-    fn translate_gva(&self, id: u32, addr: u64) -> std::result::Result<u64, std::io::Error> {
-        debug!("Translate GVA addr 0x{addr:x}");
+    fn translate_gva(
+        &self,
+        id: u32,
+        addr: u64,
+        size: u64,
+    ) -> std::result::Result<u64, std::io::Error> {
+        debug!("Translate GVA addr 0x{addr:x} size 0x{size:x}");
+        // Compute the inclusive end of the access. Reject zero-size
+        // accesses outright — a translation request without a span is
+        // meaningless and would otherwise pass any range check trivially.
+        if size == 0 {
+            return Err(io::Error::other(format!(
+                "refusing to translate zero-size GVA addr 0x{addr:x}"
+            )));
+        }
+        let Some(end) = addr.checked_add(size - 1) else {
+            return Err(io::Error::other(format!(
+                "translate GVA span overflow: addr 0x{addr:x} size 0x{size:x}"
+            )));
+        };
         if let Some(domain_id) = self.endpoints.read().unwrap().get(&id) {
             if let Some(domain) = self.domains.read().unwrap().get(domain_id) {
                 // Directly return identity mapping in case the domain is in
@@ -846,7 +864,8 @@ impl DmaRemapping for IommuMapping {
                 }
 
                 for (&key, &value) in domain.mappings.iter() {
-                    if addr >= key && addr < key + value.size {
+                    let mapping_end = key.saturating_add(value.size).saturating_sub(1);
+                    if addr >= key && end <= mapping_end {
                         let new_addr = addr - key + value.gpa;
                         debug!("Into GPA addr 0x{new_addr:x}");
                         return Ok(new_addr);
@@ -858,12 +877,27 @@ impl DmaRemapping for IommuMapping {
         }
 
         Err(io::Error::other(format!(
-            "failed to translate GVA addr 0x{addr:x}"
+            "failed to translate GVA addr 0x{addr:x} size 0x{size:x}"
         )))
     }
 
-    fn translate_gpa(&self, id: u32, addr: u64) -> std::result::Result<u64, std::io::Error> {
-        debug!("Translate GPA addr 0x{addr:x}");
+    fn translate_gpa(
+        &self,
+        id: u32,
+        addr: u64,
+        size: u64,
+    ) -> std::result::Result<u64, std::io::Error> {
+        debug!("Translate GPA addr 0x{addr:x} size 0x{size:x}");
+        if size == 0 {
+            return Err(io::Error::other(format!(
+                "refusing to translate zero-size GPA addr 0x{addr:x}"
+            )));
+        }
+        let Some(end) = addr.checked_add(size - 1) else {
+            return Err(io::Error::other(format!(
+                "translate GPA span overflow: addr 0x{addr:x} size 0x{size:x}"
+            )));
+        };
         if let Some(domain_id) = self.endpoints.read().unwrap().get(&id) {
             if let Some(domain) = self.domains.read().unwrap().get(domain_id) {
                 // Directly return identity mapping in case the domain is in
@@ -873,7 +907,8 @@ impl DmaRemapping for IommuMapping {
                 }
 
                 for (&key, &value) in domain.mappings.iter() {
-                    if addr >= value.gpa && addr < value.gpa + value.size {
+                    let mapping_gpa_end = value.gpa.saturating_add(value.size).saturating_sub(1);
+                    if addr >= value.gpa && end <= mapping_gpa_end {
                         let new_addr = addr - value.gpa + key;
                         debug!("Into GVA addr 0x{new_addr:x}");
                         return Ok(new_addr);
@@ -885,7 +920,7 @@ impl DmaRemapping for IommuMapping {
         }
 
         Err(io::Error::other(format!(
-            "failed to translate GPA addr 0x{addr:x}"
+            "failed to translate GPA addr 0x{addr:x} size 0x{size:x}"
         )))
     }
 }
@@ -903,11 +938,11 @@ impl AccessPlatformMapping {
 }
 
 impl AccessPlatform for AccessPlatformMapping {
-    fn translate_gva(&self, base: u64, _size: u64) -> std::result::Result<u64, std::io::Error> {
-        self.mapping.translate_gva(self.id, base)
+    fn translate_gva(&self, base: u64, size: u64) -> std::result::Result<u64, std::io::Error> {
+        self.mapping.translate_gva(self.id, base, size)
     }
-    fn translate_gpa(&self, base: u64, _size: u64) -> std::result::Result<u64, std::io::Error> {
-        self.mapping.translate_gpa(self.id, base)
+    fn translate_gpa(&self, base: u64, size: u64) -> std::result::Result<u64, std::io::Error> {
+        self.mapping.translate_gpa(self.id, base, size)
     }
 }
 
