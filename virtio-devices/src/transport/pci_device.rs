@@ -895,7 +895,13 @@ impl VirtioInterrupt for VirtioInterruptMsix {
         }
 
         let config = &mut self.msix_config.lock().unwrap();
-        let entry = &config.table_entries[vector as usize];
+        // The vector value is guest-controlled via the virtio common
+        // configuration (queue_msix_vector / config_msix_vector). Treat
+        // out-of-range values like VIRTQ_MSI_NO_VECTOR — silently drop
+        // the IRQ rather than indexing past the MSI-X table.
+        let Some(entry) = config.table_entries.get(vector as usize) else {
+            return Ok(());
+        };
         // In case the vector control register associated with the entry
         // has its first bit set, this means the vector is masked and the
         // device should not inject the interrupt.
@@ -917,6 +923,12 @@ impl VirtioInterrupt for VirtioInterruptMsix {
                 self.queues_vectors.lock().unwrap()[queue_index as usize]
             }
         };
+
+        if vector == VIRTQ_MSI_NO_VECTOR
+            || (vector as usize) >= self.msix_config.lock().unwrap().table_entries.len()
+        {
+            return None;
+        }
 
         self.interrupt_source_group
             .notifier(vector as InterruptIndex)
