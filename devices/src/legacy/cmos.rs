@@ -13,7 +13,7 @@ use std::{mem, thread};
 #[cfg_attr(target_env = "musl", allow(deprecated))]
 use libc::time_t;
 use libc::{CLOCK_REALTIME, clock_gettime, gmtime_r, timespec, tm};
-use log::{info, warn};
+use log::{error, info, warn};
 use vm_device::BusDevice;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -77,7 +77,9 @@ impl BusDevice for Cmos {
             DATA_OFFSET => {
                 if self.index == 0x8f && data[0] == 0 {
                     info!("CMOS reset");
-                    self.reset_evt.write(1).unwrap();
+                    if let Err(e) = self.reset_evt.write(1) {
+                        error!("CMOS: failed to signal reset_evt: {e}");
+                    }
                     if let Some(vcpus_kill_signalled) = self.vcpus_kill_signalled.take() {
                         // Spin until we are sure the reset_evt has been handled and that when
                         // we return from the KVM_RUN we will exit rather than re-enter the guest.
