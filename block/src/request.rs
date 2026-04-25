@@ -425,17 +425,21 @@ impl Request {
                 let mut discard_num_sectors = [0u8; 4];
                 let mut discard_flags = [0u8; 4];
 
-                let sector_addr = data_addr.checked_add(DISCARD_WZ_SECTOR_OFFSET).unwrap();
+                let sector_addr = data_addr
+                    .checked_add(DISCARD_WZ_SECTOR_OFFSET)
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
                 mem.read_slice(&mut discard_sector, sector_addr)
                     .map_err(ExecuteError::Read)?;
 
                 let num_sectors_addr = data_addr
                     .checked_add(DISCARD_WZ_NUM_SECTORS_OFFSET)
-                    .unwrap();
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
                 mem.read_slice(&mut discard_num_sectors, num_sectors_addr)
                     .map_err(ExecuteError::Read)?;
 
-                let flags_addr = data_addr.checked_add(DISCARD_WZ_FLAGS_OFFSET).unwrap();
+                let flags_addr = data_addr
+                    .checked_add(DISCARD_WZ_FLAGS_OFFSET)
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
                 mem.read_slice(&mut discard_flags, flags_addr)
                     .map_err(ExecuteError::Read)?;
 
@@ -491,17 +495,21 @@ impl Request {
                 let mut wz_num_sectors = [0u8; 4];
                 let mut wz_flags = [0u8; 4];
 
-                let sector_addr = data_addr.checked_add(DISCARD_WZ_SECTOR_OFFSET).unwrap();
+                let sector_addr = data_addr
+                    .checked_add(DISCARD_WZ_SECTOR_OFFSET)
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
                 mem.read_slice(&mut wz_sector, sector_addr)
                     .map_err(ExecuteError::Read)?;
 
                 let num_sectors_addr = data_addr
                     .checked_add(DISCARD_WZ_NUM_SECTORS_OFFSET)
-                    .unwrap();
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
                 mem.read_slice(&mut wz_num_sectors, num_sectors_addr)
                     .map_err(ExecuteError::Read)?;
 
-                let flags_addr = data_addr.checked_add(DISCARD_WZ_FLAGS_OFFSET).unwrap();
+                let flags_addr = data_addr
+                    .checked_add(DISCARD_WZ_FLAGS_OFFSET)
+                    .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
                 mem.read_slice(&mut wz_flags, flags_addr)
                     .map_err(ExecuteError::Read)?;
 
