@@ -414,9 +414,16 @@ impl PvmemcontrolDevice {
     }
 }
 
+/// Maximum number of bytes the guest is allowed to keep `mlock`ed via
+/// pvmemcontrol at any time. Capping this stops a guest from exhausting
+/// the host's `RLIMIT_MEMLOCK` budget through repeated mlock requests.
+const PVMEMCONTROL_MLOCK_TOTAL_CAP: u64 = 1 << 30; // 1 GiB
+
 pub struct PvmemcontrolBusDevice {
     mem: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
     dev: RwLock<PvmemcontrolDevice>,
+    /// Total bytes currently `mlock`ed via this device.
+    mlocked_bytes: std::sync::atomic::AtomicU64,
 }
 
 pub struct PvmemcontrolPciDevice {
@@ -457,18 +464,75 @@ impl PvmemcontrolBusDevice {
         })
     }
 
+    /// Reserve `length` bytes of mlock budget. Returns `Ok` only if the
+    /// reservation does not push the running total past the cap. Uses a
+    /// CAS loop so concurrent callers cannot collectively exceed the cap.
+    fn try_reserve_mlock_budget(&self, length: u64) -> Result<(), Error> {
+        use std::sync::atomic::Ordering;
+        let mut current = self.mlocked_bytes.load(Ordering::Acquire);
+        loop {
+            let new = current
+                .checked_add(length)
+                .ok_or(Error::InvalidRequest)?;
+            if new > PVMEMCONTROL_MLOCK_TOTAL_CAP {
+                return Err(Error::InvalidRequest);
+            }
+            match self.mlocked_bytes.compare_exchange_weak(
+                current,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Refund up to `length` bytes back to the budget, saturating at zero
+    /// in case the guest unlocks ranges it never locked through this
+    /// device. Uses a CAS loop to compose with concurrent reservations.
+    fn release_mlock_budget(&self, length: u64) {
+        use std::sync::atomic::Ordering;
+        let mut current = self.mlocked_bytes.load(Ordering::Acquire);
+        loop {
+            let new = current.saturating_sub(length);
+            match self.mlocked_bytes.compare_exchange_weak(
+                current,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     fn mlock(&self, addr: u64, length: u64, on_default: bool) -> result::Result<(), Error> {
+        // Reserve the budget up-front; back out on syscall failure. The
+        // cap prevents a guest from exhausting the host's RLIMIT_MEMLOCK
+        // through repeated requests.
+        self.try_reserve_mlock_budget(length)?;
         // SAFETY: [`base`, `base` + `len`) is guest memory
-        self.operate_on_memory_range(addr, length, |base, len| unsafe {
+        let result = self.operate_on_memory_range(addr, length, |base, len| unsafe {
             libc::mlock2(base, len, if on_default { libc::MLOCK_ONFAULT } else { 0 })
-        })
+        });
+        if result.is_err() {
+            self.release_mlock_budget(length);
+        }
+        result
     }
 
     fn munlock(&self, addr: u64, length: u64) -> result::Result<(), Error> {
         // SAFETY: [`base`, `base` + `len`) is guest memory
-        self.operate_on_memory_range(addr, length, |base, len| unsafe {
+        let result = self.operate_on_memory_range(addr, length, |base, len| unsafe {
             libc::munlock(base, len)
-        })
+        });
+        if result.is_ok() {
+            self.release_mlock_budget(length);
+        }
+        result
     }
 
     fn mprotect(
@@ -689,7 +753,11 @@ impl PvmemcontrolDevice {
                 configuration,
                 bar_regions: Vec::new(),
             },
-            PvmemcontrolBusDevice { mem, dev },
+            PvmemcontrolBusDevice {
+                mem,
+                dev,
+                mlocked_bytes: std::sync::atomic::AtomicU64::new(0),
+            },
         )
     }
 }
