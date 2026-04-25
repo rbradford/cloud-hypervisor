@@ -9,7 +9,7 @@ use std::sync::{Arc, Barrier};
 
 use anyhow::anyhow;
 use event_monitor::event;
-use log::{debug, info};
+use log::{debug, info, warn};
 use pci::{
     BarReprogrammingParams, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable,
     PciBarRegionType, PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType,
@@ -147,6 +147,10 @@ impl BusDevice for PvPanicDevice {
     }
 
     fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        if data.len() != 1 {
+            warn!("Invalid sized write of pvpanic register: {}", data.len());
+            return None;
+        }
         let event = self.event_to_string(data[0]);
         info!("pvpanic got guest event {event}");
         event!("guest", "panic", "event", &event);
@@ -236,6 +240,10 @@ impl PciDevice for PvPanicDevice {
     }
 
     fn read_bar(&mut self, _base: u64, _offset: u64, data: &mut [u8]) {
+        if data.len() != 1 {
+            warn!("Invalid sized read of pvpanic register: {}", data.len());
+            return;
+        }
         data[0] = self.events;
     }
 
