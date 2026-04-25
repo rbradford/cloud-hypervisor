@@ -727,16 +727,16 @@ impl PciConfiguration {
         let bar_idx = config.idx;
         let reg_idx = BAR0_REG + bar_idx;
 
+        if bar_idx >= NUM_BAR_REGS {
+            return Err(Error::BarInvalid(bar_idx));
+        }
+
         if self.bars[bar_idx].used {
             return Err(Error::BarInUse(bar_idx));
         }
 
         if !config.size.is_power_of_two() {
             return Err(Error::BarSizeInvalid(config.size));
-        }
-
-        if bar_idx >= NUM_BAR_REGS {
-            return Err(Error::BarInvalid(bar_idx));
         }
 
         let end_addr = config
