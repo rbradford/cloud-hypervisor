@@ -266,7 +266,7 @@ impl Ioapic {
             IOAPIC_REG_ID => self.id_reg = (val >> 24) & 0xf,
             IOWIN_OFF..=REG_MAX_OFFSET => {
                 let (index, is_high_bits) = decode_irq_from_selector(self.reg_sel as u8);
-                if index > NUM_IOAPIC_PINS {
+                if index >= NUM_IOAPIC_PINS {
                     warn!("IOAPIC index out of range: {index}");
                     return;
                 }
@@ -303,7 +303,7 @@ impl Ioapic {
             IOAPIC_REG_ID | IOAPIC_REG_ARBITRATION_ID => (self.id_reg & 0xf) << 24,
             IOWIN_OFF..=REG_MAX_OFFSET => {
                 let (index, is_high_bits) = decode_irq_from_selector(self.reg_sel as u8);
-                if index > NUM_IOAPIC_PINS {
+                if index >= NUM_IOAPIC_PINS {
                     warn!("IOAPIC index out of range: {index}");
                     return 0;
                 }
