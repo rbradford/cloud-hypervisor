@@ -2377,7 +2377,28 @@ impl cpu::Vcpu for KvmVcpu {
                             // bits[5-63] = zero
                             let attributes = hypercall.args[2];
                             // TODO: Add 2mb page support
-                            let size = num_pages * PAGE_SIZE_4K;
+                            // num_pages and address come from the guest;
+                            // ignore requests where num_pages * PAGE_SIZE_4K
+                            // overflows, where address + size overflows, or
+                            // where address is not page-aligned.
+                            let Some(size) = num_pages.checked_mul(PAGE_SIZE_4K) else {
+                                warn!(
+                                    "KVM_HC_MAP_GPA_RANGE: pages*page_size overflow (pages={num_pages})"
+                                );
+                                return Ok(cpu::VmExit::Ignore);
+                            };
+                            if address.checked_add(size).is_none() {
+                                warn!(
+                                    "KVM_HC_MAP_GPA_RANGE: address+size overflow (address={address:#x}, size={size:#x})"
+                                );
+                                return Ok(cpu::VmExit::Ignore);
+                            }
+                            if address & (PAGE_SIZE_4K - 1) != 0 {
+                                warn!(
+                                    "KVM_HC_MAP_GPA_RANGE: address not page-aligned ({address:#x})"
+                                );
+                                return Ok(cpu::VmExit::Ignore);
+                            }
                             // bit 4 = private attribute encoding
                             const PRIVATE_ENCODING_BITMASK: u64 = 0b10000;
                             debug!(
