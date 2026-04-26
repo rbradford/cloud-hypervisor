@@ -711,7 +711,11 @@ impl cpu::Vcpu for MshvVcpu {
                     }
 
                     let num_ranges = info.__bindgen_anon_1.range_count();
-                    assert!(num_ranges >= 1);
+                    if num_ranges < 1 {
+                        return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                            "GPA_ATTRIBUTE_INTERCEPT with zero ranges"
+                        )));
+                    }
                     if num_ranges > 1 {
                         return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                             "Unhandled VCPU exit(GPA_ATTRIBUTE_INTERCEPT): Expected num_ranges to be 1 but found num_ranges {num_ranges:?}"
