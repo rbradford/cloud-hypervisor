@@ -846,8 +846,14 @@ impl cpu::Vcpu for MshvVcpu {
                             // print them out together or implement some rate limiting.]
                         }
                         GHCB_INFO_HYP_FEATURE_REQUEST => {
-                            // Pre-condition: GHCB data must be zero
-                            assert!(ghcb_data == 0);
+                            // Pre-condition: GHCB data must be zero. The
+                            // guest controls ghcb_data; reject non-zero
+                            // rather than aborting the VM.
+                            if ghcb_data != 0 {
+                                return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                    "GHCB_INFO_HYP_FEATURE_REQUEST has non-zero data: {ghcb_data:#x}"
+                                )));
+                            }
                             let mut ghcb_response = GHCB_INFO_HYP_FEATURE_RESPONSE as u64;
                             // Indicate support for basic SEV-SNP features
                             ghcb_response |=
