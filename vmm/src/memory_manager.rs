@@ -2856,18 +2856,20 @@ impl MemoryManager {
         );
 
         // SAFETY: caller promises parameters are correct.
-        unsafe {
-            self.vm
-                .create_user_memory_region(
-                    slot,
-                    guest_phys_addr,
-                    memory_size,
-                    userspace_addr,
-                    readonly,
-                    log_dirty,
-                    visibility,
-                )
-                .map_err(Error::CreateUserMemoryRegion)?;
+        let create_res = unsafe {
+            self.vm.create_user_memory_region(
+                slot,
+                guest_phys_addr,
+                memory_size,
+                userspace_addr,
+                readonly,
+                log_dirty,
+                visibility,
+            )
+        };
+        if let Err(e) = create_res {
+            self.memory_slot_allocator().free_memory_slot(slot);
+            return Err(Error::CreateUserMemoryRegion(e));
         }
 
         // SAFETY: the address and size are valid since the
