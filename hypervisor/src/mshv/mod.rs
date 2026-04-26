@@ -1062,8 +1062,13 @@ impl cpu::Vcpu for MshvVcpu {
                                     let data_len =
                                         info.__bindgen_anon_2.__bindgen_anon_1.sw_exit_info2
                                             as usize;
-                                    // Sanity check to make sure data len is within supported range.
-                                    assert!(data_len <= 0x8);
+                                    // sw_exit_info2 is guest-controlled; reject
+                                    // anything larger than the GHCB shared slot.
+                                    if data_len > 0x8 {
+                                        return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                            "MMIO_READ data_len {data_len} exceeds GHCB slot"
+                                        )));
+                                    }
 
                                     let mut data: Vec<u8> = vec![0; data_len];
                                     if let Some(vm_ops) = &self.vm_ops {
@@ -1086,8 +1091,13 @@ impl cpu::Vcpu for MshvVcpu {
                                     let data_len =
                                         info.__bindgen_anon_2.__bindgen_anon_1.sw_exit_info2
                                             as usize;
-                                    // Sanity check to make sure data len is within supported range.
-                                    assert!(data_len <= 0x8);
+                                    // sw_exit_info2 is guest-controlled; reject
+                                    // anything larger than the GHCB shared slot.
+                                    if data_len > 0x8 {
+                                        return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                            "MMIO_WRITE data_len {data_len} exceeds GHCB slot"
+                                        )));
+                                    }
 
                                     let mut data = vec![0; data_len];
                                     // SAFETY: Accessing data from a mapped address
