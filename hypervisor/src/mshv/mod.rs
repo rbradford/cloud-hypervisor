@@ -2375,11 +2375,29 @@ impl vm::Vm for MshvVm {
             return Ok(());
         }
 
-        let start_gpfn: u64 = gpa >> PAGE_SHIFT;
-        let end_gpfn: u64 = (gpa + size as u64 - 1) >> PAGE_SHIFT;
+        // Empty range is a no-op. Without this guard, computing
+        // (gpa + size - 1) wraps when both are 0 (a guest descriptor
+        // with addr=0,len=0 is enough to reach this in release builds),
+        // which then yields a 2^52-PFN range collected into a Vec — OOM
+        // aborts the entire VMM process.
+        if size == 0 {
+            return Ok(());
+        }
 
-        // Enlarge the bitmap if the PFN is greater than the bitmap length
-        if end_gpfn >= self.host_access_pages.load().as_ref().len() as u64 {
+        let start_gpfn: u64 = gpa >> PAGE_SHIFT;
+        let end_gpfn: u64 = match gpa.checked_add(size as u64).and_then(|v| v.checked_sub(1)) {
+            Some(last) => last >> PAGE_SHIFT,
+            None => {
+                return Err(vm::HypervisorVmError::ModifyGpaHostAccess(anyhow!(
+                    "gpa+size overflow in gain_page_access (gpa={gpa:#x}, size={size})"
+                )));
+            }
+        };
+
+        // Enlarge the bitmap until end_gpfn is in range. The previous
+        // single-shot enlarge could fall short for end_gpfn beyond
+        // bitmap_len + ONE_GB pages.
+        while end_gpfn >= self.host_access_pages.load().as_ref().len() as u64 {
             self.host_access_pages.rcu(|bitmap| {
                 let mut bm = bitmap.as_ref().clone();
                 bm.enlarge(ONE_GB);
