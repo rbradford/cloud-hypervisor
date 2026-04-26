@@ -1011,7 +1011,9 @@ impl cpu::Vcpu for MshvVcpu {
                                                 name: hv_register_name_HV_X64_REGISTER_SEV_DOORBELL_GPA,
                                                 ..Default::default()
                                             } ];
-                                            self.fd.get_reg(&mut reg_assocs).unwrap();
+                                            self.fd.get_reg(&mut reg_assocs).map_err(|e| {
+                                                cpu::HypervisorCpuError::GetRegister(e.into())
+                                            })?;
                                             // SAFETY: Accessing a union element from bindgen generated bindings.
                                             let doorbell_gpa = unsafe { reg_assocs[0].value.reg64 };
 
@@ -1023,14 +1025,10 @@ impl cpu::Vcpu for MshvVcpu {
                                         SVM_NAE_HV_DOORBELL_PAGE_CLEAR => {
                                             set_svm_field_u64_ptr!(ghcb, exit_info2, 0);
                                         }
-                                        #[expect(
-                                            clippy::panic,
-                                            reason = "unsupported GHCB request"
-                                        )]
                                         _ => {
-                                            panic!(
-                                                "SVM_EXITCODE_HV_DOORBELL_PAGE: Unhandled exit code: {exit_info1:0x}"
-                                            );
+                                            return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                                "SVM_EXITCODE_HV_DOORBELL_PAGE: unsupported exit_info1 {exit_info1:#x}"
+                                            )));
                                         }
                                     }
                                 }
@@ -1297,8 +1295,11 @@ impl cpu::Vcpu for MshvVcpu {
                                  (reason_set={reason_set}, reason_val={reason_val})"
                             )));
                         }
-                        #[expect(clippy::panic, reason = "unsupported GHCB request")]
-                        _ => panic!("Unsupported VMGEXIT operation: {ghcb_op:0x}"),
+                        _ => {
+                            return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                "Unsupported VMGEXIT operation {ghcb_op:#x}"
+                            )));
+                        }
                     }
 
                     Ok(cpu::VmExit::Ignore)
@@ -1641,7 +1642,9 @@ impl MshvVcpu {
             name: hv_register_name_HV_X64_REGISTER_SEV_GHCB_GPA,
             ..Default::default()
         }];
-        self.fd.get_reg(&mut reg_assocs).unwrap();
+        self.fd
+            .get_reg(&mut reg_assocs)
+            .map_err(|e| cpu::HypervisorCpuError::GetRegister(e.into()))?;
         // SAFETY: Accessing a union element from bindgen generated bindings.
         let prev_ghcb_gpa = unsafe { reg_assocs[0].value.reg64 };
 
