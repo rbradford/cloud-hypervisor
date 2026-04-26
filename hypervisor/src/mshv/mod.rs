@@ -833,7 +833,12 @@ impl cpu::Vcpu for MshvVcpu {
                     // SAFETY: Accessing a union element from bindgen generated bindings.
                     let ghcb_op = unsafe { ghcb_msr.__bindgen_anon_2.ghcb_info() as u32 };
                     // Sanity check on the header fields before handling other operations.
-                    assert!(info.header.intercept_access_type == HV_INTERCEPT_ACCESS_EXECUTE as u8);
+                    if info.header.intercept_access_type != HV_INTERCEPT_ACCESS_EXECUTE as u8 {
+                        return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                            "VMGEXIT intercept_access_type {} not EXECUTE",
+                            info.header.intercept_access_type,
+                        )));
+                    }
 
                     match ghcb_op {
                         GHCB_INFO_SPECIAL_DBGPRINT => {
