@@ -124,6 +124,19 @@ impl MshvEmulatorContext<'_> {
         data: &mut [u8],
         flags: u32,
     ) -> Result<(), PlatformError> {
+        if !data.is_empty() {
+            let last = gva
+                .checked_add(data.len() as u64 - 1)
+                .ok_or_else(|| PlatformError::MemoryReadFailure(anyhow!("GVA range overflow")))?;
+            let first_page = gva >> HV_HYP_PAGE_SHIFT;
+            let last_page = last >> HV_HYP_PAGE_SHIFT;
+            if last_page - first_page > 1 {
+                return Err(PlatformError::MemoryReadFailure(anyhow!(
+                    "Unsupported cross-page span: {first_page:#x}..{last_page:#x}"
+                )));
+            }
+        }
+
         let len = first_page_len(gva, data.len());
 
         self.r(gva, &mut data[..len], flags)?;
@@ -216,6 +229,19 @@ impl PlatformEmulator for MshvEmulatorContext<'_> {
     }
 
     fn write_memory(&mut self, gva: u64, data: &[u8]) -> Result<(), PlatformError> {
+        if !data.is_empty() {
+            let last = gva
+                .checked_add(data.len() as u64 - 1)
+                .ok_or_else(|| PlatformError::MemoryWriteFailure(anyhow!("GVA range overflow")))?;
+            let first_page = gva >> HV_HYP_PAGE_SHIFT;
+            let last_page = last >> HV_HYP_PAGE_SHIFT;
+            if last_page - first_page > 1 {
+                return Err(PlatformError::MemoryWriteFailure(anyhow!(
+                    "Unsupported cross-page span: {first_page:#x}..{last_page:#x}"
+                )));
+            }
+        }
+
         let len = first_page_len(gva, data.len());
 
         self.w(gva, &data[..len])?;
