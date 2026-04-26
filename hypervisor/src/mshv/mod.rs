@@ -1266,9 +1266,10 @@ impl cpu::Vcpu for MshvVcpu {
 
                                     self.clear_swexit_info1()?;
                                 }
-                                #[expect(clippy::panic, reason = "unsupported GHCB request")]
                                 _ => {
-                                    panic!("GHCB_INFO_NORMAL: Unhandled exit code: {exit_code:0x}")
+                                    return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                                        "GHCB_INFO_NORMAL: Unhandled exit code: {exit_code:#x}"
+                                    )));
                                 }
                             }
                         }
