@@ -940,7 +940,7 @@ impl cpu::Vcpu for MshvVcpu {
                             let cpu_leaf = self
                                 .fd
                                 .get_cpuid_values(sev_cpuid_function, 0, 0, 0)
-                                .unwrap();
+                                .map_err(|e| cpu::HypervisorCpuError::GetCpuidVales(e.into()))?;
                             let ebx = cpu_leaf[1];
                             // First 6-byte of EBX represents page table encryption bit number
                             let pbit_encryption = (ebx & 0x3f) as u8;
