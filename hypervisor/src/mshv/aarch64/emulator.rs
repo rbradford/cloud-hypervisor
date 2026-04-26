@@ -84,7 +84,10 @@ impl<'a> Emulator<'a> {
                     data &= 0xffffffff;
                 }
             }
-            gprs[reg_index as usize] = data;
+            // XZR (31) discards the loaded value; gprs only holds X0-X30.
+            if reg_index < 31 {
+                gprs[reg_index as usize] = data;
+            }
         }
 
         let pc = regs.get_pc();
