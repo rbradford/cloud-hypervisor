@@ -56,10 +56,13 @@ const START_ANNOUNCEMENTS_EVENT: u16 = CTRL_QUEUE_EVENT + 1;
 // Retry post-migration or post-restore announcements.
 const RETRY_ANNOUNCEMENTS_EVENT: u16 = START_ANNOUNCEMENTS_EVENT + 1;
 
+// Interval between announcement rounds.
+const ANNOUNCE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
 // Following the VIRTIO specification, the MTU should be at least 1280.
 pub const MIN_MTU: u16 = 1280;
 
-pub struct NetCtrlEpollHandler<A: AnnounceOps> {
+pub struct NetCtrlEpollHandler {
     pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
     pub kill_evt: EventFd,
     pub pause_evt: EventFd,
@@ -71,11 +74,11 @@ pub struct NetCtrlEpollHandler<A: AnnounceOps> {
     pub queue_index: u16,
     pub announce_evt: EventFd,
     pub announce_retry_timer: TimerFd,
-    /// Device-specific announcement logic used after a migration or restore.
-    pub announce_ops: A,
+    /// Drives the post-migration / post-restore announcements.
+    pub announcer: Announcer,
 }
 
-impl<A: AnnounceOps> NetCtrlEpollHandler<A> {
+impl NetCtrlEpollHandler {
     fn signal_used_queue(&self, queue_index: u16) -> result::Result<(), DeviceError> {
         self.interrupt_cb
             .trigger(VirtioInterruptType::Queue(queue_index))
@@ -102,14 +105,9 @@ impl<A: AnnounceOps> NetCtrlEpollHandler<A> {
         Ok(())
     }
 
-    const ANNOUNCE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
-
     fn arm_retry_timer(&mut self) -> result::Result<(), EpollHelperError> {
         self.announce_retry_timer
-            .reset(
-                Self::ANNOUNCE_RETRY_INTERVAL,
-                Some(Self::ANNOUNCE_RETRY_INTERVAL),
-            )
+            .reset(ANNOUNCE_RETRY_INTERVAL, Some(ANNOUNCE_RETRY_INTERVAL))
             .context("Failed to arm announcement retry timer")
             .map_err(EpollHelperError::HandleEvent)
     }
@@ -122,7 +120,7 @@ impl<A: AnnounceOps> NetCtrlEpollHandler<A> {
     }
 }
 
-impl<A: AnnounceOps> EpollHelperHandler for NetCtrlEpollHandler<A> {
+impl EpollHelperHandler for NetCtrlEpollHandler {
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,
@@ -171,8 +169,8 @@ impl<A: AnnounceOps> EpollHelperHandler for NetCtrlEpollHandler<A> {
                     ))
                 })?;
 
-                self.announce_ops.initialize();
-                match self.announce_ops.send_announce() {
+                self.announcer.start();
+                match self.announcer.send() {
                     AnnounceOutcome::Done => self.disarm_retry_timer()?,
                     AnnounceOutcome::Retry => self.arm_retry_timer()?,
                 }
@@ -184,7 +182,7 @@ impl<A: AnnounceOps> EpollHelperHandler for NetCtrlEpollHandler<A> {
                     ))
                 })?;
 
-                match self.announce_ops.send_announce() {
+                match self.announcer.send() {
                     AnnounceOutcome::Done => self.disarm_retry_timer()?,
                     AnnounceOutcome::Retry => {}
                 }
@@ -474,12 +472,7 @@ pub struct Net {
     rate_limiter_config: Option<RateLimiterConfig>,
     exit_evt: EventFd,
     device_status: Arc<AtomicU8>,
-    announce_pending: Arc<AtomicBool>,
-    /// Generation counter used to invalidate active announcers before a
-    /// reset or device teardown, so they stop sending notifications.
-    announce_generation: Arc<AtomicU64>,
-    /// When signaled, the epoll thread will do the announcements.
-    announce_evt: EventFd,
+    announce: GuestAnnounce,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -519,11 +512,9 @@ impl Net {
             }
         };
 
-        let (avail_features, acked_features, config, queue_sizes, paused, announce_pending) =
+        let (avail_features, acked_features, config, queue_sizes, paused, restored) =
             if let Some(state) = state {
                 info!("Restoring virtio-net {id}");
-                // Always set [`Self::announce_pending`] to true if the device was restored to
-                // make sure the device announces itself.
                 (
                     state.avail_features,
                     state.acked_features,
@@ -609,9 +600,12 @@ impl Net {
             rate_limiter_config,
             exit_evt,
             device_status: Arc::new(AtomicU8::new(0)),
-            announce_pending: Arc::new(AtomicBool::new(announce_pending)),
-            announce_generation: Arc::new(AtomicU64::new(0)),
-            announce_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(Error::CreateEventFd)?,
+            announce: if restored {
+                GuestAnnounce::restored(acked_features)
+            } else {
+                GuestAnnounce::new()
+            }
+            .map_err(Error::CreateEventFd)?,
         })
     }
 
@@ -727,72 +721,6 @@ impl Net {
         }
     }
 
-    /// Compute the guest-visible virtio-net status field.
-    fn guest_visible_status(&self) -> u16 {
-        let mut status = 0;
-
-        if self.common.feature_acked(VIRTIO_NET_F_STATUS.into()) {
-            status |= VIRTIO_NET_S_LINK_UP as u16;
-
-            if self.announce_pending.load(Ordering::Acquire) {
-                status |= VIRTIO_NET_S_ANNOUNCE as u16;
-            }
-        }
-
-        status
-    }
-
-    /// Re-notify the guest about a restored pending ANNOUNCE request once the
-    /// device and driver are ready to do announcements.
-    fn notify_pending_guest_announce(&self) {
-        if self.announce_pending.load(Ordering::Acquire) {
-            self.announce_generation.fetch_add(1, Ordering::Release);
-            self.announce_evt
-                .write(1)
-                .inspect_err(|e| warn!("Could not write to announce EventFd: {e:?}"))
-                .ok();
-        }
-    }
-
-    // Builds a reverse ARP packet with this device's MAC address. Without a
-    // negotiated VIRTIO_NET_F_MAC feature, valid construction paths may leave
-    // config.mac as zeros, which must not be announced on the host network.
-    fn build_rarp_announce(&self) -> Option<[u8; ETH_FRAME_LEN]> {
-        if !self.common.feature_acked(VIRTIO_NET_F_MAC.into()) {
-            return None;
-        }
-
-        const ETH_P_RARP: u16 = 0x8035; // Ethertype RARP
-        const ARP_HTYPE_ETH: u16 = 0x1; // Hardware type Ethernet
-        const ARP_PTYPE_IP: u16 = 0x0800; // Protocol type IPv4
-        const ARP_OP_REQUEST_REV: u16 = 0x0003; // RARP Request opcode
-
-        const IPV4_ADDR_LENGTH: usize = 4; // Size of an IPv4 address
-
-        let mut buf = [0u8; ETH_FRAME_LEN];
-
-        // Ethernet header
-        buf[0..6].copy_from_slice(&[0xff; MAC_ADDR_LEN]); // This is a broadcast
-        buf[6..12].copy_from_slice(&self.config.mac); // Src is this NIC
-        buf[12..14].copy_from_slice(&ETH_P_RARP.to_be_bytes()); // This is a RARP packet
-
-        // ARP Header
-        buf[14..16].copy_from_slice(&ARP_HTYPE_ETH.to_be_bytes());
-        buf[16..18].copy_from_slice(&ARP_PTYPE_IP.to_be_bytes());
-        buf[18] = MAC_ADDR_LEN as u8; // Hardware address length (ethernet)
-        buf[19] = IPV4_ADDR_LENGTH as u8; // Protocol address length (IPv4)
-        // This is a "fake RARP" packet, we don't want to perform a real RARP lookup.
-        // Thus the content of the next fields is largely irrelevant. Setting source
-        // hardware address = target hardware address is fine according to RFC 903.
-        buf[20..22].copy_from_slice(&ARP_OP_REQUEST_REV.to_be_bytes());
-        buf[22..28].copy_from_slice(&self.config.mac); // Source hardware address
-        buf[28..32].copy_from_slice(&[0x00; IPV4_ADDR_LENGTH]); // Source protocol address
-        buf[32..38].copy_from_slice(&self.config.mac); // Target hardware address
-        buf[38..42].copy_from_slice(&[0x00; IPV4_ADDR_LENGTH]); // Target protocol address
-
-        Some(buf)
-    }
-
     #[cfg(fuzzing)]
     pub fn wait_for_epoll_threads(&mut self) {
         self.common.wait_for_epoll_threads();
@@ -818,7 +746,7 @@ impl VirtioDevice for Net {
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         let mut config = self.config;
-        config.status = self.guest_visible_status();
+        config.status = self.announce.status_bits(self.common.acked_features);
         self.read_config_from_slice(config.as_slice(), offset, data);
     }
 
@@ -850,32 +778,29 @@ impl VirtioDevice for Net {
 
             let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
 
-            let announce_ops = VirtioNetAnnounceOps::new(
-                interrupt_cb.clone(),
-                self.common
-                    .feature_acked(VIRTIO_NET_F_GUEST_ANNOUNCE.into()),
-                self.announce_pending.clone(),
-                self.announce_generation.clone(),
-                self.build_rarp_announce(),
+            let rarp = RarpAnnounce::new(
+                self.common.acked_features,
+                self.config.mac,
                 self.taps.clone().into_boxed_slice(),
             );
+            let announcer = self.announce.announcer(interrupt_cb.clone(), rarp);
 
             let mut ctrl_handler = NetCtrlEpollHandler {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(self.taps.clone(), Arc::clone(&self.announce_pending)),
+                ctrl_q: CtrlQueue::new(self.taps.clone(), self.announce.pending_flag()),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: self.common.access_platform(),
                 queue_index: ctrl_queue_index as u16,
                 interrupt_cb: interrupt_cb.clone(),
                 announce_evt: self
-                    .announce_evt
-                    .try_clone()
+                    .announce
+                    .clone_evt()
                     .map_err(ActivateError::CloneEventFd)?,
                 announce_retry_timer: TimerFd::new().map_err(ActivateError::CreateTimerFd)?,
-                announce_ops,
+                announcer,
             };
 
             let paused = self.common.paused.clone();
@@ -968,7 +893,7 @@ impl VirtioDevice for Net {
             )?;
         }
 
-        self.notify_pending_guest_announce();
+        self.announce.notify();
 
         event!("virtio-device", "activated", "id", &self.id);
         Ok(())
@@ -976,8 +901,7 @@ impl VirtioDevice for Net {
 
     fn reset(&mut self) {
         self.common.reset();
-        self.announce_generation.fetch_add(1, Ordering::Release);
-        self.announce_pending.store(false, Ordering::Release);
+        self.announce.reset();
         event!("virtio-device", "reset", "id", &self.id);
     }
 
@@ -1015,13 +939,13 @@ impl VirtioDevice for Net {
 
 impl Pausable for Net {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        self.announce_generation.fetch_add(1, Ordering::Release);
+        self.announce.invalidate();
         self.common.pause()
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         self.common.resume()?;
-        self.notify_pending_guest_announce();
+        self.announce.notify();
         Ok(())
     }
 }
@@ -1038,159 +962,257 @@ impl Snapshottable for Net {
 impl Transportable for Net {}
 impl Migratable for Net {
     fn start_migration(&mut self) -> result::Result<(), MigratableError> {
-        self.announce_generation.fetch_add(1, Ordering::Release);
+        self.announce.invalidate();
         Ok(())
     }
 }
 
-/// Whether announcements have to be retried. To avoid ambiguity when using a bool,
-/// this enum clearly describes whether announcements are done, or have to be
-/// retried.
+/// Rounds to retry before giving up on a guest that never ACKs the announce.
+const MAX_ANNOUNCEMENTS: usize = 5;
+
+/// Whether another announcement round is needed.
 pub enum AnnounceOutcome {
     Retry,
     Done,
 }
 
-/// Backend-specific logic for driving announcements. [`NetCtrlEpollHandler`]
-/// uses this to share the control flow between virtio-net and vhost-user-net.
-pub trait AnnounceOps: Send {
-    const MAX_ANNOUNCEMENTS: usize = 5;
-
-    /// Initialize this instance of [`AnnounceOps`].
-    fn initialize(&mut self);
-
-    /// Send an announcement and return whether this function has to be executed
-    /// again.
-    fn send_announce(&mut self) -> AnnounceOutcome;
+/// Device-side guest-announce state, shared by virtio-net and vhost-user-net.
+/// Keeping it in one place guarantees both backends compute the config status,
+/// the restore-time pending flag, and the generation bookkeeping identically.
+pub struct GuestAnnounce {
+    /// Set while the guest still owes a `VIRTIO_NET_CTRL_ANNOUNCE_ACK`.
+    pending: Arc<AtomicBool>,
+    /// Bumped to invalidate an in-flight [`Announcer`] before a reset, pause,
+    /// migration, or a fresh notify.
+    generation: Arc<AtomicU64>,
+    /// Wakes the control-queue epoll thread to start announcing.
+    evt: EventFd,
 }
 
-struct VirtioNetAnnounceOps {
-    interrupt_cb: Arc<dyn VirtioInterrupt>,
-    guest_announce_negotiated: bool,
-    announce_pending: Arc<AtomicBool>,
-    announce_generation: Arc<AtomicU64>,
-    generation: u64,
-    rarp_announce: Option<[u8; ETH_FRAME_LEN]>,
-    taps: Box<[Tap]>,
-    announcements_done: usize,
-}
+impl GuestAnnounce {
+    /// Fresh (non-restored) device: nothing pending.
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            pending: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            evt: EventFd::new(libc::EFD_NONBLOCK)?,
+        })
+    }
 
-impl VirtioNetAnnounceOps {
-    pub fn new(
+    /// Restored device: announce iff the guest negotiated
+    /// `VIRTIO_NET_F_GUEST_ANNOUNCE`. This single rule replaces the two
+    /// backends' divergent restore paths.
+    pub fn restored(acked_features: u64) -> io::Result<Self> {
+        let this = Self::new()?;
+        let pending = acked_features & (1 << VIRTIO_NET_F_GUEST_ANNOUNCE) != 0;
+        this.pending.store(pending, Ordering::Release);
+        Ok(this)
+    }
+
+    /// Shared handle to the pending flag for the control queue's ACK handler.
+    pub fn pending_flag(&self) -> Arc<AtomicBool> {
+        self.pending.clone()
+    }
+
+    /// Full guest-visible config `status` word. The ANNOUNCE bit is gated on
+    /// both `VIRTIO_NET_F_STATUS` and `VIRTIO_NET_F_GUEST_ANNOUNCE`, so it can
+    /// never reach a guest that did not ask for it.
+    pub fn status_bits(&self, acked_features: u64) -> u16 {
+        let mut status = 0;
+        if acked_features & (1 << VIRTIO_NET_F_STATUS) != 0 {
+            status |= VIRTIO_NET_S_LINK_UP as u16;
+            if acked_features & (1 << VIRTIO_NET_F_GUEST_ANNOUNCE) != 0
+                && self.pending.load(Ordering::Acquire)
+            {
+                status |= VIRTIO_NET_S_ANNOUNCE as u16;
+            }
+        }
+        status
+    }
+
+    /// Invalidate an in-flight announcer without dropping the request, used by
+    /// pause and start_migration.
+    pub fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Invalidate the in-flight announcer and drop any pending request.
+    pub fn reset(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.pending.store(false, Ordering::Release);
+    }
+
+    /// Kick the epoll thread to (re)start announcing if a request is pending.
+    /// `pending` is only ever set when the feature was negotiated, so this
+    /// needs no further feature check.
+    pub fn notify(&self) {
+        if self.pending.load(Ordering::Acquire) {
+            self.generation.fetch_add(1, Ordering::Release);
+            self.evt
+                .write(1)
+                .inspect_err(|e| warn!("Could not write to announce EventFd: {e:?}"))
+                .ok();
+        }
+    }
+
+    /// Build the announcer driven by the control-queue epoll thread. Backends
+    /// without taps (vhost-user-net) pass `rarp = None`.
+    pub fn announcer(
+        &self,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        guest_announce_negotiated: bool,
-        announce_pending: Arc<AtomicBool>,
-        announce_generation: Arc<AtomicU64>,
-        rarp_announce: Option<[u8; ETH_FRAME_LEN]>,
-        taps: Box<[Tap]>,
-    ) -> Self {
-        Self {
+        rarp: Option<RarpAnnounce>,
+    ) -> Announcer {
+        Announcer {
             interrupt_cb,
-            guest_announce_negotiated,
-            announce_pending,
-            announce_generation,
-            generation: 0,
-            rarp_announce,
-            taps,
+            pending: self.pending.clone(),
+            generation: self.generation.clone(),
+            observed_generation: 0,
+            rarp,
             announcements_done: 0,
         }
     }
 
-    fn send_guest_announce(&mut self) -> AnnounceOutcome {
-        if !self.guest_announce_negotiated {
-            // [`Net::announce_pending`] does double duty: we use it to signal that the
-            // driver in the guest has to send announcements, but we also use it to signal
-            // that the device has been constructed from a `State` (e.g. after a
-            // live-migration or during snapshot restore). Thus, it may happen that
-            // VIRTIO_NET_F_GUEST_ANNOUNCE was not negotiated, but [`Net::announce_pending`]
-            // is set. In this case, we just clear it here.
-            self.announce_pending.store(false, Ordering::Release);
-            return AnnounceOutcome::Done;
-        }
-
-        // If the guest hasn't ack'ed the announce, we trigger the interrupt.
-        if self.announce_pending.load(Ordering::Acquire) {
-            self.interrupt_cb
-                .trigger(VirtioInterruptType::Config)
-                .inspect_err(|e| {
-                    warn!("Unable to send interrupt for virtio-net device: {e}");
-                })
-                .ok();
-
-            // We have to check again whether the driver ack'ed the announcement.
-            return AnnounceOutcome::Retry;
-        }
-        AnnounceOutcome::Done
-    }
-
-    fn send_host_announce(&mut self) -> AnnounceOutcome {
-        if let Some(rarp_announce) = self.rarp_announce {
-            // The TAP fd expects the virtio-net header configured by
-            // TUNSETVNETHDRSZ before the Ethernet frame.
-            let mut buf = vec![0u8; vnet_hdr_len() + rarp_announce.len()];
-            buf[vnet_hdr_len()..].copy_from_slice(&rarp_announce);
-
-            for tap in &mut self.taps {
-                if let Err(e) = tap.write(&buf) {
-                    // The host-side RARP packets are best-effort. Thus, to keep things simple, we
-                    // only log errors here instead of waiting for the TAP to become writable again.
-                    error!("Host RARP write to TAP failed: {e}");
-                }
-            }
-
-            return AnnounceOutcome::Retry;
-        }
-
-        AnnounceOutcome::Done
+    /// Clone the wakeup eventfd for the epoll handler.
+    pub fn clone_evt(&self) -> io::Result<EventFd> {
+        self.evt.try_clone()
     }
 }
 
-impl AnnounceOps for VirtioNetAnnounceOps {
-    fn initialize(&mut self) {
-        self.generation = self.announce_generation.load(Ordering::Acquire);
+/// Host-side RARP announcement over the backing TAP interfaces. Only virtio-net
+/// (which owns the taps) provides this; vhost-user-net passes `None`.
+pub struct RarpAnnounce {
+    /// vnet header + ethernet RARP frame, ready to write to the TAP fd.
+    frame: Vec<u8>,
+    taps: Box<[Tap]>,
+}
+
+impl RarpAnnounce {
+    /// Returns `None` if `VIRTIO_NET_F_MAC` was not negotiated: without it the
+    /// config MAC may be zero, which must not be announced on the host network.
+    pub fn new(acked_features: u64, mac: [u8; MAC_ADDR_LEN], taps: Box<[Tap]>) -> Option<Self> {
+        if acked_features & (1 << VIRTIO_NET_F_MAC) == 0 {
+            return None;
+        }
+
+        // The TAP fd expects the virtio-net header configured by
+        // TUNSETVNETHDRSZ before the Ethernet frame.
+        let eth = build_rarp_frame(mac);
+        let mut frame = vec![0u8; vnet_hdr_len() + eth.len()];
+        frame[vnet_hdr_len()..].copy_from_slice(&eth);
+
+        Some(Self { frame, taps })
+    }
+
+    fn send(&mut self) {
+        for tap in &mut self.taps {
+            // Best-effort: log and move on rather than wait for the TAP to
+            // become writable again.
+            if let Err(e) = tap.write(&self.frame) {
+                error!("Host RARP write to TAP failed: {e}");
+            }
+        }
+    }
+}
+
+/// Builds a "fake" reverse ARP packet for the given MAC. The content beyond the
+/// source hardware address is largely irrelevant; per RFC 903 setting the
+/// source and target hardware addresses equal is fine.
+fn build_rarp_frame(mac: [u8; MAC_ADDR_LEN]) -> [u8; ETH_FRAME_LEN] {
+    const ETH_P_RARP: u16 = 0x8035;
+    const ARP_HTYPE_ETH: u16 = 0x1;
+    const ARP_PTYPE_IP: u16 = 0x0800;
+    const ARP_OP_REQUEST_REV: u16 = 0x0003;
+    const IPV4_ADDR_LENGTH: usize = 4;
+
+    let mut buf = [0u8; ETH_FRAME_LEN];
+
+    // Ethernet header
+    buf[0..6].copy_from_slice(&[0xff; MAC_ADDR_LEN]);
+    buf[6..12].copy_from_slice(&mac);
+    buf[12..14].copy_from_slice(&ETH_P_RARP.to_be_bytes());
+
+    // ARP header
+    buf[14..16].copy_from_slice(&ARP_HTYPE_ETH.to_be_bytes());
+    buf[16..18].copy_from_slice(&ARP_PTYPE_IP.to_be_bytes());
+    buf[18] = MAC_ADDR_LEN as u8;
+    buf[19] = IPV4_ADDR_LENGTH as u8;
+    buf[20..22].copy_from_slice(&ARP_OP_REQUEST_REV.to_be_bytes());
+    buf[22..28].copy_from_slice(&mac);
+    buf[28..32].copy_from_slice(&[0x00; IPV4_ADDR_LENGTH]);
+    buf[32..38].copy_from_slice(&mac);
+    buf[38..42].copy_from_slice(&[0x00; IPV4_ADDR_LENGTH]);
+
+    buf
+}
+
+/// Drives announcements from the control-queue epoll thread. One implementation
+/// for both backends; host RARP is optional.
+pub struct Announcer {
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+    pending: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    observed_generation: u64,
+    rarp: Option<RarpAnnounce>,
+    announcements_done: usize,
+}
+
+impl Announcer {
+    /// Snapshot the generation and reset the round counter. Both backends go
+    /// through this, so the counter can never be left stale between runs.
+    fn start(&mut self) {
+        self.observed_generation = self.generation.load(Ordering::Acquire);
         self.announcements_done = 0;
     }
 
-    fn send_announce(&mut self) -> AnnounceOutcome {
-        if self.announce_generation.load(Ordering::Acquire) != self.generation
-            || self.announcements_done >= Self::MAX_ANNOUNCEMENTS
+    /// Perform one announcement round and report whether another is needed.
+    fn send(&mut self) -> AnnounceOutcome {
+        if self.generation.load(Ordering::Acquire) != self.observed_generation
+            || self.announcements_done >= MAX_ANNOUNCEMENTS
         {
             return AnnounceOutcome::Done;
         }
 
-        let guest = self.send_guest_announce();
-        let host = self.send_host_announce();
+        // Guest announce: re-raise the config interrupt until the guest ACKs.
+        let guest_retry = if self.pending.load(Ordering::Acquire) {
+            self.interrupt_cb
+                .trigger(VirtioInterruptType::Config)
+                .inspect_err(|e| warn!("Unable to send interrupt for virtio-net device: {e}"))
+                .ok();
+            true
+        } else {
+            false
+        };
+
+        // Host announce: best-effort RARP over the taps, if this backend has any.
+        let host_retry = if let Some(rarp) = self.rarp.as_mut() {
+            rarp.send();
+            true
+        } else {
+            false
+        };
 
         self.announcements_done += 1;
-        if self.announcements_done < Self::MAX_ANNOUNCEMENTS
-            && (matches!(guest, AnnounceOutcome::Retry) || matches!(host, AnnounceOutcome::Retry))
-        {
-            return AnnounceOutcome::Retry;
+        if self.announcements_done < MAX_ANNOUNCEMENTS && (guest_retry || host_retry) {
+            AnnounceOutcome::Retry
+        } else {
+            AnnounceOutcome::Done
         }
-        AnnounceOutcome::Done
     }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use std::mem::{offset_of, size_of};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use seccompiler::SeccompAction;
-    use virtio_bindings::virtio_net::{VIRTIO_NET_F_STATUS, VIRTIO_NET_S_LINK_UP};
-    use vmm_sys_util::eventfd::EventFd;
 
     use super::*;
 
-    fn test_net(
-        acked_features: u64,
-        interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
-    ) -> Result<Net> {
+    fn test_net(acked_features: u64) -> Result<Net> {
         Ok(Net {
             common: VirtioCommon {
                 acked_features,
-                interrupt_cb,
                 ..Default::default()
             },
             id: "test-net".to_string(),
@@ -1201,9 +1223,7 @@ mod unit_tests {
             rate_limiter_config: None,
             exit_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
             device_status: Arc::new(AtomicU8::new(0)),
-            announce_pending: Arc::new(AtomicBool::new(false)),
-            announce_generation: Arc::new(AtomicU64::new(0)),
-            announce_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(Error::CreateEventFd)?,
+            announce: GuestAnnounce::new().map_err(Error::CreateEventFd)?,
         })
     }
 
@@ -1219,24 +1239,15 @@ mod unit_tests {
         )
     }
 
-    #[test]
-    fn test_status_feature_reports_link_up() {
-        // The current implementation should always report "link up" if
-        // VIRTIO_NET_F_STATUS has been negotiated.
-        let net = test_net(1 << VIRTIO_NET_F_STATUS, None).unwrap();
-
-        assert_eq!(read_status(&net), VIRTIO_NET_S_LINK_UP as u16);
-    }
-
     struct TestInterrupt {
         config_count: AtomicUsize,
     }
 
     impl TestInterrupt {
-        fn new() -> Self {
-            Self {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
                 config_count: AtomicUsize::new(0),
-            }
+            })
         }
     }
 
@@ -1258,162 +1269,133 @@ mod unit_tests {
         }
     }
 
-    fn test_announce_ops(dev: &Net) -> Result<VirtioNetAnnounceOps> {
-        Ok(VirtioNetAnnounceOps::new(
-            dev.common.interrupt_cb.clone().unwrap(),
-            dev.common.feature_acked(VIRTIO_NET_F_GUEST_ANNOUNCE.into()),
-            dev.announce_pending.clone(),
-            dev.announce_generation.clone(),
-            dev.build_rarp_announce(),
-            dev.taps.clone().into_boxed_slice(),
-        ))
+    fn guest_announcer(announce: &GuestAnnounce, interrupt: Arc<dyn VirtioInterrupt>) -> Announcer {
+        announce.announcer(interrupt, None)
     }
 
     #[test]
-    fn test_announce_ops_stop_retrying_on_generation_change() {
-        let interrupt = Arc::new(TestInterrupt::new());
-        let net = test_net(
+    fn test_status_feature_reports_link_up() {
+        // Link up is always reported once VIRTIO_NET_F_STATUS is negotiated.
+        let net = test_net(1 << VIRTIO_NET_F_STATUS).unwrap();
+        assert_eq!(read_status(&net), VIRTIO_NET_S_LINK_UP as u16);
+    }
+
+    #[test]
+    fn test_read_config_surfaces_announce_when_pending() {
+        let mut net =
+            test_net((1 << VIRTIO_NET_F_STATUS) | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE)).unwrap();
+        net.announce = GuestAnnounce::restored(
             (1 << VIRTIO_NET_F_STATUS) | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE),
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
         )
         .unwrap();
-        let mut announce_ops = test_announce_ops(&net).unwrap();
 
-        net.announce_pending.store(true, Ordering::Release);
-
-        announce_ops.initialize();
-        assert!(matches!(
-            announce_ops.send_announce(),
-            AnnounceOutcome::Retry
-        ));
-
-        net.announce_generation.store(1, Ordering::Release);
-
-        assert!(matches!(
-            announce_ops.send_announce(),
-            AnnounceOutcome::Done
-        ));
-        assert!(net.announce_pending.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn test_guest_ack_before_first_announce_run() {
-        let interrupt = Arc::new(TestInterrupt::new());
-        let net = test_net(
-            (1 << VIRTIO_NET_F_STATUS) | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE),
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
-        )
-        .unwrap();
-        let mut announce_ops = test_announce_ops(&net).unwrap();
-
-        // Here we check what happens if the guest ACK arrives before the epoll thread
-        // does the first announcement.
-        net.announce_pending.store(true, Ordering::Release);
-        announce_ops.initialize();
-        net.announce_pending.store(false, Ordering::Release);
-
-        assert!(matches!(
-            announce_ops.send_announce(),
-            AnnounceOutcome::Done
-        ));
-        assert!(!net.announce_pending.load(Ordering::Acquire));
-        assert_eq!(read_status(&net) & VIRTIO_NET_S_ANNOUNCE as u16, 0);
-        assert_eq!(interrupt.config_count.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn test_post_migration_without_feature_is_noop() {
-        let interrupt = Arc::new(TestInterrupt::new());
-        let net = test_net(0, Some(interrupt.clone() as Arc<dyn VirtioInterrupt>)).unwrap();
-        let mut announce_ops = test_announce_ops(&net).unwrap();
-
-        net.announce_pending.store(true, Ordering::Release);
-
-        announce_ops.initialize();
-        assert!(matches!(
-            announce_ops.send_announce(),
-            AnnounceOutcome::Done
-        ));
-
-        assert!(!net.announce_pending.load(Ordering::Acquire));
-        assert_eq!(read_status(&net) & VIRTIO_NET_S_ANNOUNCE as u16, 0);
-        assert_eq!(interrupt.config_count.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn test_reset_clears_pending_announce() {
-        let interrupt = Arc::new(TestInterrupt::new());
-        let mut net = test_net(
-            (1 << VIRTIO_NET_F_GUEST_ANNOUNCE) | (1 << VIRTIO_NET_F_STATUS),
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
-        )
-        .unwrap();
-        let mut announce_ops = test_announce_ops(&net).unwrap();
-
-        net.announce_pending.store(true, Ordering::Release);
-
-        announce_ops.initialize();
-        assert!(matches!(
-            announce_ops.send_announce(),
-            AnnounceOutcome::Retry
-        ));
-
-        assert!(net.announce_pending.load(Ordering::Acquire));
+        assert_eq!(
+            read_status(&net) & VIRTIO_NET_S_ANNOUNCE as u16,
+            VIRTIO_NET_S_ANNOUNCE as u16
+        );
 
         net.reset();
-
-        assert!(!net.announce_pending.load(Ordering::Acquire));
         assert_eq!(read_status(&net) & VIRTIO_NET_S_ANNOUNCE as u16, 0);
     }
 
-    fn assert_old_announcer_invalidated<F>(invalidate: F)
-    where
-        F: FnOnce(&mut Net),
-    {
-        let interrupt = Arc::new(TestInterrupt::new());
-        let mut net = test_net(
-            1 << VIRTIO_NET_F_GUEST_ANNOUNCE,
-            Some(interrupt.clone() as Arc<dyn VirtioInterrupt>),
-        )
-        .unwrap();
-        let mut announce_ops = test_announce_ops(&net).unwrap();
+    #[test]
+    fn restored_gates_pending_on_feature() {
+        let with = GuestAnnounce::restored(1 << VIRTIO_NET_F_GUEST_ANNOUNCE).unwrap();
+        assert!(with.pending.load(Ordering::Acquire));
 
-        net.announce_pending.store(true, Ordering::Release);
+        let without = GuestAnnounce::restored(0).unwrap();
+        assert!(!without.pending.load(Ordering::Acquire));
+    }
 
-        announce_ops.initialize();
-        assert!(matches!(
-            announce_ops.send_announce(),
-            AnnounceOutcome::Retry
-        ));
+    #[test]
+    fn status_bits_gate_announce_on_both_features() {
+        let announce = GuestAnnounce::new().unwrap();
+        announce.pending.store(true, Ordering::Release);
+
+        // STATUS only: link up, but no announce leak.
+        let status = announce.status_bits(1 << VIRTIO_NET_F_STATUS);
+        assert_eq!(
+            status & VIRTIO_NET_S_LINK_UP as u16,
+            VIRTIO_NET_S_LINK_UP as u16
+        );
+        assert_eq!(status & VIRTIO_NET_S_ANNOUNCE as u16, 0);
+
+        // STATUS + GUEST_ANNOUNCE: announce surfaces.
+        let status =
+            announce.status_bits((1 << VIRTIO_NET_F_STATUS) | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE));
+        assert_eq!(
+            status & VIRTIO_NET_S_ANNOUNCE as u16,
+            VIRTIO_NET_S_ANNOUNCE as u16
+        );
+
+        // Without STATUS the whole field stays zero.
+        assert_eq!(announce.status_bits(0), 0);
+    }
+
+    #[test]
+    fn announcer_retries_until_acked() {
+        let interrupt = TestInterrupt::new();
+        let announce = GuestAnnounce::new().unwrap();
+        announce.pending.store(true, Ordering::Release);
+        let mut announcer = guest_announcer(&announce, interrupt.clone());
+
+        announcer.start();
+        assert!(matches!(announcer.send(), AnnounceOutcome::Retry));
         assert_eq!(interrupt.config_count.load(Ordering::Acquire), 1);
 
-        invalidate(&mut net);
-        assert!(matches!(
-            announce_ops.send_announce(),
-            AnnounceOutcome::Done
-        ));
-
+        // Guest ACKs by clearing pending: the next round is the last.
+        announce.pending.store(false, Ordering::Release);
+        assert!(matches!(announcer.send(), AnnounceOutcome::Done));
         assert_eq!(interrupt.config_count.load(Ordering::Acquire), 1);
     }
 
     #[test]
-    fn test_reset_invalidates_old_announcer() {
-        assert_old_announcer_invalidated(|net| {
-            net.reset();
-        });
+    fn announcer_stops_after_max_rounds() {
+        let interrupt = TestInterrupt::new();
+        let announce = GuestAnnounce::new().unwrap();
+        announce.pending.store(true, Ordering::Release);
+        let mut announcer = guest_announcer(&announce, interrupt.clone());
+
+        announcer.start();
+        let mut rounds = 0;
+        while let AnnounceOutcome::Retry = announcer.send() {
+            rounds += 1;
+            assert!(rounds < MAX_ANNOUNCEMENTS + 1);
+        }
+        assert_eq!(
+            interrupt.config_count.load(Ordering::Acquire),
+            MAX_ANNOUNCEMENTS
+        );
     }
 
     #[test]
-    fn test_pause_invalidates_old_announcer() {
-        assert_old_announcer_invalidated(|net| {
-            net.pause().unwrap();
-        });
+    fn ack_before_first_round_sends_nothing() {
+        let interrupt = TestInterrupt::new();
+        let announce = GuestAnnounce::new().unwrap();
+        announce.pending.store(true, Ordering::Release);
+        let mut announcer = guest_announcer(&announce, interrupt.clone());
+
+        announcer.start();
+        announce.pending.store(false, Ordering::Release);
+
+        assert!(matches!(announcer.send(), AnnounceOutcome::Done));
+        assert_eq!(interrupt.config_count.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn test_start_migration_invalidates_old_announcer() {
-        assert_old_announcer_invalidated(|net| {
-            net.start_migration().unwrap();
-        });
+    fn invalidate_and_reset_stop_in_flight_announcer() {
+        for invalidate in [GuestAnnounce::invalidate, GuestAnnounce::reset] {
+            let interrupt = TestInterrupt::new();
+            let announce = GuestAnnounce::new().unwrap();
+            announce.pending.store(true, Ordering::Release);
+            let mut announcer = guest_announcer(&announce, interrupt.clone());
+
+            announcer.start();
+            assert!(matches!(announcer.send(), AnnounceOutcome::Retry));
+
+            invalidate(&announce);
+            assert!(matches!(announcer.send(), AnnounceOutcome::Done));
+            assert_eq!(interrupt.config_count.load(Ordering::Acquire), 1);
+        }
     }
 }
