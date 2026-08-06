@@ -94,25 +94,22 @@ impl BatEntry {
         data_blocks_count + (data_blocks_count - 1) / chunk_ratio
     }
 
-    // Routine for writing BAT entries to the disk
-    pub(super) fn write_bat_entries(
+    // Update one BAT entry by index.
+    pub(super) fn write_bat_entry(
         f: &AlignedFile,
         bat_offset: u64,
-        bat_entries: &[BatEntry],
+        index: u64,
+        value: u64,
     ) -> Result<()> {
-        for i in 0..bat_entries.len() as u64 {
-            let bat_entry = match bat_entries.get(i as usize) {
-                Some(entry) => entry.0,
-                None => {
-                    return Err(VhdxBatError::InvalidBatEntry);
-                }
-            };
+        let offset = index
+            .checked_mul(size_of::<u64>() as u64)
+            .and_then(|o| bat_offset.checked_add(o))
+            .ok_or(VhdxBatError::InvalidBatEntry)?;
 
-            let mut buf = [0u8; size_of::<u64>()];
-            LittleEndian::write_u64(&mut buf, bat_entry);
-            f.write_all_at(&buf, bat_offset + i * size_of::<u64>() as u64)
-                .map_err(VhdxBatError::WriteBat)?;
-        }
+        let mut buf = [0u8; size_of::<u64>()];
+        LittleEndian::write_u64(&mut buf, value);
+        f.write_all_at(&buf, offset)
+            .map_err(VhdxBatError::WriteBat)?;
         Ok(())
     }
 }
