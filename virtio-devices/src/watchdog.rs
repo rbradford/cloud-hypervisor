@@ -17,7 +17,7 @@ use std::{ptr, result};
 
 use anyhow::anyhow;
 use event_monitor::event;
-use log::{error, info};
+use log::{error, info, warn};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -55,12 +55,8 @@ const WATCHDOG_TIMEOUT: u64 = WATCHDOG_TIMER_INTERVAL as u64 + 5;
 enum Error {
     #[error("Error programming timer fd")]
     TimerfdSetup(#[source] io::Error),
-    #[error("Descriptor chain too short")]
-    DescriptorChainTooShort,
     #[error("Failed adding used index")]
     QueueAddUsed(#[source] virtio_queue::Error),
-    #[error("Invalid descriptor")]
-    InvalidDescriptor,
     #[error("Failed to write to guest memory")]
     GuestMemoryWrite(#[source] guest_memory::Error),
 }
@@ -84,15 +80,17 @@ impl WatchdogEpollHandler {
         let queue = &mut self.queue;
         let mut used_descs = false;
         while let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
-            let mut descs = desc_chain.checked_iter(None);
-            let desc = descs
-                .next()
-                .ok_or(Error::DescriptorChainTooShort)?
-                .map_err(|_| Error::InvalidDescriptor)?;
-
-            if !desc.is_write_only() || desc.is_empty() {
-                return Err(Error::InvalidDescriptor);
-            }
+            let desc = match desc_chain.next_checked(None) {
+                Ok(Some(desc)) if desc.is_write_only() && !desc.is_empty() => desc,
+                invalid => {
+                    warn!("Invalid watchdog descriptor: {invalid:?}");
+                    queue
+                        .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                        .map_err(Error::QueueAddUsed)?;
+                    used_descs = true;
+                    continue;
+                }
+            };
 
             desc_chain
                 .memory()
@@ -462,3 +460,75 @@ impl Snapshottable for Watchdog {
 
 impl Transportable for Watchdog {}
 impl Migratable for Watchdog {}
+
+#[cfg(test)]
+mod tests {
+    use virtio_bindings::bindings::virtio_ring::VRING_DESC_F_WRITE;
+    use vm_memory::GuestAddress;
+    use vm_virtio::queue::testing::VirtQueue;
+
+    use super::*;
+
+    struct NoopInterrupt;
+
+    impl VirtioInterrupt for NoopInterrupt {
+        fn trigger(&self, _int_type: VirtioInterruptType) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_notifier(
+            &self,
+            _int_type: u32,
+            _notifier: Option<EventFd>,
+            _vm: &dyn hypervisor::Vm,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn invalid_descriptors_do_not_prevent_a_watchdog_ping() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let guest_queue = VirtQueue::new(GuestAddress(0x1000), &mem, QUEUE_SIZE);
+        let write = VRING_DESC_F_WRITE as u16;
+        let descriptors = [
+            (0x5000, 1, 0),
+            (0x4000, 0, write),
+            (0x10000, 1, write),
+            (0x4000, 1, write),
+        ];
+        for (i, &(addr, len, flags)) in descriptors.iter().enumerate() {
+            guest_queue.dtable[i].set(addr, len, flags, 0);
+            guest_queue.avail.ring[i].set(i as u16);
+        }
+        guest_queue.avail.idx.set(descriptors.len() as u16);
+        let timer_fd = timerfd_create().unwrap();
+        // SAFETY: timerfd_create returned a new owned descriptor.
+        let timer = unsafe { File::from_raw_fd(timer_fd) };
+        let mut handler = WatchdogEpollHandler {
+            mem: GuestMemoryAtomic::new(mem.clone()),
+            queue: guest_queue.create_queue(),
+            interrupt_cb: Arc::new(NoopInterrupt),
+            queue_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            kill_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            pause_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            timer,
+            last_ping_time: Arc::new(Mutex::new(None)),
+            reset_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+        };
+
+        assert!(handler.process_queue().unwrap());
+        assert_eq!(guest_queue.used.idx.get(), 4);
+        for (i, entry) in guest_queue.used.ring.iter().take(4).enumerate() {
+            let addr = entry.location;
+            let id = u32::from_le(mem.read_obj::<u32>(addr).unwrap());
+            let len = u32::from_le(mem.read_obj::<u32>(GuestAddress(addr.0 + 4)).unwrap());
+            assert_eq!(id, i as u32);
+            assert_eq!(len, u32::from(i == 3));
+        }
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x4000)).unwrap(), 1);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0x5000)).unwrap(), 0);
+        assert!(handler.last_ping_time.lock().unwrap().is_some());
+        assert!(!handler.process_queue().unwrap());
+    }
+}
