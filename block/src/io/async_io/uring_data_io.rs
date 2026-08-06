@@ -29,9 +29,6 @@ pub struct UringDataIo {
     // remain valid until completion; metadata operations store `None`.
     in_flight: HashMap<u64, Option<AsyncIoOperation>>,
     completions: CompletionCommon,
-    // `needs_submit_retry` is set when SQEs have been published to the ring,
-    // but the submit syscall failed before confirming kernel ownership.
-    needs_submit_retry: bool,
 }
 
 impl UringDataIo {
@@ -57,7 +54,6 @@ impl UringDataIo {
             io_uring,
             in_flight: HashMap::new(),
             completions,
-            needs_submit_retry: false,
         })
     }
 
@@ -83,23 +79,15 @@ impl UringDataIo {
     fn submit_kernel_entry(&mut self, user_data: u64, entry: &squeue::Entry) -> io::Result<()> {
         self.reserve_user_data(user_data)?;
 
-        let (submitter, mut sq, _) = self.io_uring.split();
+        let (_, mut sq, _) = self.io_uring.split();
         // SAFETY: the entry has no caller-owned buffer. `user_data` is retained
         // in `in_flight` until the CQE is consumed.
         if let Err(e) = unsafe { sq.push(entry) } {
             self.in_flight.remove(&user_data);
             return Err(io::Error::other(format!("Submission queue is full: {e:?}")));
         }
-        sq.sync();
-
-        match submitter.submit() {
-            Ok(_) => self.needs_submit_retry = false,
-            Err(e) => {
-                self.needs_submit_retry = true;
-                warn!("io_uring submit failed after SQE was published: {e}");
-                self.completions.notifier().write(1).unwrap();
-            }
-        }
+        drop(sq);
+        self.submit_pending();
 
         Ok(())
     }
@@ -116,7 +104,7 @@ impl UringDataIo {
 
         validate_batch(|user_data| self.in_flight.contains_key(&user_data), &batch)?;
 
-        let (submitter, mut sq, _) = self.io_uring.split();
+        let (_, mut sq, _) = self.io_uring.split();
         let available = sq.capacity() - sq.len();
         if batch.len() > available {
             // Not enough space for the batch.
@@ -152,20 +140,29 @@ impl UringDataIo {
             }
         }
 
-        sq.sync();
-        match submitter.submit() {
-            Ok(_) => self.needs_submit_retry = false,
-            Err(e) => {
-                self.needs_submit_retry = true;
-                warn!("io_uring submit failed after SQEs were published: {e}");
-                signal_completion = true;
-            }
-        }
+        drop(sq);
+        self.submit_pending();
         if signal_completion {
             self.completions.notifier().write(1).unwrap();
         }
 
         Ok(())
+    }
+
+    fn submit_pending(&mut self) {
+        if self.io_uring.submission().is_empty() {
+            return;
+        }
+
+        if let Err(e) = self.io_uring.submitter().submit() {
+            warn!("io_uring submit failed for retained SQEs: {e}");
+        }
+
+        // Reload the kernel's SQ head. A successful submit may consume only
+        // part of the queue, including entries retained from an earlier call.
+        if !self.io_uring.submission().is_empty() {
+            self.completions.notifier().write(1).unwrap();
+        }
     }
 
     #[cold]
@@ -234,12 +231,7 @@ impl UringDataIo {
     /// Consuming a kernel completion returns ownership of any buffer retained
     /// by the corresponding operation.
     pub fn next_completion(&mut self) -> Option<AsyncIoCompletion> {
-        if self.needs_submit_retry {
-            match self.io_uring.submitter().submit() {
-                Ok(_) => self.needs_submit_retry = false,
-                Err(e) => warn!("io_uring retry submit failed for retained SQEs: {e}"),
-            }
-        }
+        self.submit_pending();
 
         if let Some(entry) = self.io_uring.completion().next() {
             let user_data = entry.user_data();
@@ -261,12 +253,6 @@ impl Drop for UringDataIo {
     fn drop(&mut self) {
         // Closing the ring fd does not cancel io_uring ops that have started.
         // Wait for CQEs before releasing retained iovecs.
-        if self.needs_submit_retry {
-            if let Err(e) = self.io_uring.submitter().submit() {
-                warn!("io_uring drain submit failed for retained SQEs: {e}");
-            }
-            self.needs_submit_retry = false;
-        }
 
         let max_drain_iterations = self.in_flight.len().saturating_mul(2);
         let mut drain_iterations = 0;
@@ -282,6 +268,7 @@ impl Drop for UringDataIo {
                 break;
             }
             drain_iterations += 1;
+            self.submit_pending();
 
             if let Some(entry) = self.io_uring.completion().next() {
                 self.in_flight.remove(&entry.user_data());
@@ -327,6 +314,77 @@ mod tests {
         }
 
         panic!("timed out waiting for io_uring completion");
+    }
+
+    #[test]
+    fn uring_completion_retries_a_partially_consumed_queue() {
+        let mut data_io = UringDataIo::new(8).unwrap();
+        for user_data in 0..3 {
+            data_io.reserve_user_data(user_data).unwrap();
+            let entry = opcode::Nop::new().build().user_data(user_data);
+            // SAFETY: NOP entries have no buffers; each user_data is retained
+            // in in_flight until its completion is consumed.
+            unsafe { data_io.io_uring.submission().push(&entry) }.unwrap();
+        }
+
+        // SAFETY: Submit one of the three published entries with no wait,
+        // flags or signal mask. The remaining entries stay in the SQ.
+        let consumed = unsafe {
+            data_io
+                .io_uring
+                .submitter()
+                .enter::<libc::sigset_t>(1, 0, 0, None)
+        }
+        .unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(data_io.io_uring.submission().len(), 2);
+
+        let mut completed = Vec::new();
+        for _ in 0..3 {
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.result, 0);
+            completed.push(completion.user_data);
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, vec![0, 1, 2]);
+        assert!(data_io.io_uring.submission().is_empty());
+        assert!(data_io.in_flight.is_empty());
+    }
+
+    #[test]
+    fn uring_drop_submits_retained_write_buffers() {
+        use std::os::unix::fs::FileExt;
+
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(1536).unwrap();
+        let mut data_io = UringDataIo::new(8).unwrap();
+        for user_data in 0..3 {
+            let op = AsyncIoOperation::write_from_vec(
+                user_data as libc::off_t * 512,
+                OwnedIoBuffer::from_vec(vec![user_data as u8 + 1; 512]),
+                user_data,
+            );
+            let entry = UringDataIo::build_entry(file.as_raw_fd(), &op);
+            data_io.in_flight.insert(user_data, Some(op));
+            // SAFETY: in_flight owns each operation's buffers until completion.
+            unsafe { data_io.io_uring.submission().push(&entry) }.unwrap();
+        }
+        // SAFETY: Submit one published entry with no wait, flags or signal mask.
+        let consumed = unsafe {
+            data_io
+                .io_uring
+                .submitter()
+                .enter::<libc::sigset_t>(1, 0, 0, None)
+        }
+        .unwrap();
+        assert_eq!(consumed, 1);
+        drop(data_io);
+
+        let mut contents = vec![0; 1536];
+        file.read_exact_at(&mut contents, 0).unwrap();
+        for (i, chunk) in contents.chunks(512).enumerate() {
+            assert!(chunk.iter().all(|byte| *byte == i as u8 + 1));
+        }
     }
 
     #[test]
