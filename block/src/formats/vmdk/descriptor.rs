@@ -189,39 +189,41 @@ fn parse_extents<'a>(
         if line.is_empty() || line.starts_with('#') || line.starts_with("ddb.") {
             continue;
         }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 4 || parts.len() == 5 {
-            let size_in_sectors = parts[1].parse::<u64>().map_err(|_| {
+        let invalid_extent =
+            || io::Error::new(io::ErrorKind::InvalidData, "Malformed VMDK extent line");
+        let (fields, file) = line.split_once('"').ok_or_else(invalid_extent)?;
+        let (filename, offset) = file.split_once('"').ok_or_else(invalid_extent)?;
+        let parts: Vec<&str> = fields.split_whitespace().collect();
+        if parts.len() != 3 || filename.is_empty() {
+            return Err(invalid_extent());
+        }
+        let size_in_sectors = parts[1].parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "VMDK extent size '{}' is not a valid sector count",
+                    parts[1]
+                ),
+            )
+        })?;
+        let offset = offset.trim();
+        let offset_in_sectors = if offset.is_empty() {
+            0
+        } else {
+            offset.parse::<u64>().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "VMDK extent size '{}' is not a valid sector count",
-                        parts[1]
-                    ),
+                    format!("VMDK extent offset '{offset}' is not a valid sector count"),
                 )
-            })?;
-            let offset_in_sectors = match parts.get(4) {
-                Some(offset) => offset.parse::<u64>().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("VMDK extent offset '{offset}' is not a valid sector count"),
-                    )
-                })?,
-                None => 0,
-            };
-            extents.extents.push(VmdkExtentHeader {
-                access: parts[0].parse::<ExtentAccess>()?,
-                size_in_sectors,
-                extent_type: parts[2].to_string(),
-                filename: parts[3].trim_matches('"').to_string(),
-                offset_in_sectors,
-            });
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Malformed VMDK extent line",
-            ));
-        }
+            })?
+        };
+        extents.extents.push(VmdkExtentHeader {
+            access: parts[0].parse::<ExtentAccess>()?,
+            size_in_sectors,
+            extent_type: parts[2].to_string(),
+            filename: filename.to_string(),
+            offset_in_sectors,
+        });
     }
 
     Ok(extents)
@@ -397,10 +399,26 @@ mod tests {
     }
 
     #[test]
+    fn quoted_extent_filenames_are_preserved() {
+        for filename in ["space disk.vmdk", "Hash#=Case.vmdk", " space # = disk "] {
+            let body = format!("RW 128 FLAT \"{filename}\" 7\n");
+            let extents = parse_body("", &body).unwrap();
+            assert_eq!(extents.extents[0].filename, filename);
+            assert_eq!(extents.extents[0].offset_in_sectors, 7);
+        }
+    }
+
+    #[test]
     fn rejects_malformed_extent_line() {
-        // Only three fields -> malformed.
-        let body: &str = "RW 2097152 FLAT\n";
-        parse_body("# Extent description", body).unwrap_err();
+        for body in [
+            "RW 2097152 FLAT\n",
+            "RW 128 FLAT bare.vmdk 0\n",
+            "RW 128 FLAT \"unclosed.vmdk\n",
+            "RW 128 FLAT \"\" 0\n",
+            "RW 128 FLAT \"disk.vmdk\" 0 extra\n",
+        ] {
+            parse_body("", body).unwrap_err();
+        }
     }
 
     #[test]
