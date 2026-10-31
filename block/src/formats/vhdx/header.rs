@@ -67,8 +67,6 @@ pub enum VhdxHeaderError {
     RegionEntryOverflow(u64 /* start */, usize /* length */),
     #[error("Overlapping regions found")]
     RegionOverlap,
-    #[error("Reserved region has non-zero value")]
-    ReservedIsNonZero,
     #[error("Header sequence number would overflow")]
     SequenceNumberOverflow,
     #[error("We do not recognize this entry")]
@@ -206,10 +204,6 @@ impl RegionTableHeader {
 
         if region_table_header.entry_count > 2047 {
             return Err(VhdxHeaderError::InvalidEntryCount);
-        }
-
-        if region_table_header.reserved != 0 {
-            return Err(VhdxHeaderError::ReservedIsNonZero);
         }
 
         Ok(region_table_header)
@@ -425,7 +419,7 @@ mod tests {
     use super::{
         BAT_GUID, HEADER_1_START, HEADER_2_START, HEADER_SIGN, Header, MDR_GUID,
         REGION_TABLE_1_START, RegionInfo, RegionTableHeader, VhdxHeader, VhdxHeaderError,
-        ranges_overlap,
+        calculate_checksum, ranges_overlap,
     };
     use crate::aligned_file::AlignedFile;
     use crate::formats::vhdx::test_util::create_dynamic_vhdx;
@@ -547,6 +541,22 @@ mod tests {
         };
         let file = AlignedFile::new(tf.into_file(), false);
         file.write_all_at(&[0; 4], 256 * 1024).unwrap();
+        VhdxHeader::new(&file).unwrap();
+    }
+
+    #[test]
+    fn region_table_reserved_field_is_ignored() {
+        let Some(tf) = create_dynamic_vhdx(1) else {
+            return;
+        };
+        let file = AlignedFile::new(tf.into_file(), false);
+        let mut table = [0; 64 * 1024];
+        file.read_exact_at(&mut table, REGION_TABLE_1_START)
+            .unwrap();
+        table[12..16].fill(0xff);
+        let checksum = calculate_checksum(&mut table, 4);
+        table[4..8].copy_from_slice(&checksum.to_le_bytes());
+        file.write_all_at(&table, REGION_TABLE_1_START).unwrap();
         VhdxHeader::new(&file).unwrap();
     }
 
