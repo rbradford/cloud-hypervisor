@@ -561,21 +561,36 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_total_virtual_size_overflow() {
-        // Two extents whose individual lengths fit in a u64 but whose running
-        // sum (the total virtual disk size) overflows. size = 2^55 - 1 =>
-        // length = 2^64 - 512, two of them overflow the total.
-        let dir = TempDir::new_with_prefix("/tmp/vmdk-ovf-total-test").unwrap();
-        let size = (1u64 << 55) - 1;
-        let l1 = format!("NOACCESS {size} FLAT \"s001.vmdk\"");
-        let l2 = format!("NOACCESS {size} FLAT \"s002.vmdk\"");
-        let path = write_descriptor(
-            dir.as_path(),
-            "twoGbMaxExtentFlat",
-            &[l1.as_str(), l2.as_str()],
+    fn monolithic_flat_rejects_multiple_extents() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-monolithic-test").unwrap();
+        let line = "NOACCESS 8 FLAT \"missing.vmdk\"";
+        let path = write_descriptor(dir.as_path(), "monolithicFlat", &[line, line]);
+        let mut file = open_descriptor(&path);
+        assert!(!is_flat_vmdk(&mut file).unwrap());
+        assert_eq!(
+            FlatVmdk::new(file, &path, false, false).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
+    }
 
-        let err = FlatVmdk::new(open_descriptor(&path), &path, false, false).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    #[test]
+    fn split_flat_extents_are_limited_to_two_gib() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-split-size-test").unwrap();
+        for sectors in [1 << 22, (1 << 22) + 1] {
+            let line = format!("NOACCESS {sectors} FLAT \"s001.vmdk\"");
+            let path = write_descriptor(
+                dir.as_path(),
+                "twoGbMaxExtentFlat",
+                &[&line, "NOACCESS 1 FLAT \"s002.vmdk\""],
+            );
+            let mut file = open_descriptor(&path);
+            let valid = sectors == 1 << 22;
+            assert_eq!(is_flat_vmdk(&mut file).unwrap(), valid);
+            let result = FlatVmdk::new(file, &path, false, false);
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
     }
 }

@@ -111,11 +111,33 @@ impl VmdkDescriptor {
                 "VMDK descriptor lists no extents",
             ));
         }
+        if matches!(header.create_type, VMDKDiskType::MonolithicFlat)
+            && extents_list.extents.len() != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Monolithic VMDK must have exactly one extent",
+            ));
+        }
         for extent in &extents_list.extents {
             if !extent.extent_type.eq_ignore_ascii_case("FLAT") {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!("Unsupported VMDK extent type '{}'", extent.extent_type),
+                ));
+            }
+            if extent.size_in_sectors == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VMDK flat extent has zero size",
+                ));
+            }
+            if matches!(header.create_type, VMDKDiskType::TwoGbMaxExtentFlat)
+                && extent.size_in_sectors > 1 << 22
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Split VMDK extent exceeds 2 GiB",
                 ));
             }
         }

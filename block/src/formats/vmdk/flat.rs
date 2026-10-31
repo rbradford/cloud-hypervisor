@@ -351,16 +351,6 @@ impl FlatVmdk {
             Vec::with_capacity(descriptor.extents_list.extents.len());
         let mut virtual_start: u64 = 0;
         for extent in &descriptor.extents_list.extents {
-            // A flat extent is a fixed, pre-allocated region, a zero-sector
-            // extent would back an empty virtual range that can never be read
-            // or written
-            if extent.size_in_sectors == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "VMDK flat extent has zero size",
-                ));
-            }
-
             let length = extent
                 .size_in_sectors
                 .checked_mul(VMDK_SECTOR_SIZE)
