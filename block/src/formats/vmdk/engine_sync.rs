@@ -190,24 +190,10 @@ impl AsyncIo for FlatVmdkSync {
     }
 
     fn submit_data_operation(&mut self, mut op: AsyncIoOperation) -> AsyncIoResult<()> {
-        let size = self.vmdk.virtual_block_size();
+        op.validate_bounds(self.vmdk.virtual_block_size())?;
         let start = op.offset() as u64;
         let total = op.total_len() as u64;
         let is_read = op.is_read();
-
-        // Bounds check against the virtual disk size (overflow-safe: `start`
-        // is checked before subtracting it from `size`).
-        if start > size || total > size - start {
-            let error = io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("VMDK request (start {start}, length {total}) exceeds virtual size {size}"),
-            );
-            return Err(if is_read {
-                AsyncIoError::ReadVectored(error)
-            } else {
-                AsyncIoError::WriteVectored(error)
-            });
-        }
 
         // Reject the request up front if any extent it touches forbids it:
         // NOACCESS extents reject all I/O.
