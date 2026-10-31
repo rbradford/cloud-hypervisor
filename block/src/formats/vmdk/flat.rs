@@ -368,7 +368,7 @@ impl FlatVmdk {
                 .offset_in_sectors
                 .checked_mul(VMDK_SECTOR_SIZE)
                 .ok_or_else(|| overflow_error("extent file offset"))?;
-            file_base_offset
+            let file_end = file_base_offset
                 .checked_add(length)
                 .ok_or_else(|| overflow_error("extent file range"))?;
 
@@ -388,6 +388,18 @@ impl FlatVmdk {
                 }
                 ExtentAccess::NoAccess => None,
             };
+            if let Some(file) = &extent_file {
+                let (size, _) = query_device_size(file.file())?;
+                if file_end > size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "VMDK extent '{}' exceeds backing size {size}",
+                            extent.filename
+                        ),
+                    ));
+                }
+            }
 
             extents.push(VmdkExtent {
                 file: extent_file,

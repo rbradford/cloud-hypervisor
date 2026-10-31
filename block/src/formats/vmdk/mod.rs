@@ -470,6 +470,24 @@ mod tests {
     }
 
     #[test]
+    fn extent_ranges_must_fit_the_backing_file() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-size-test").unwrap();
+        let data = File::create(dir.as_path().join("data.vmdk")).unwrap();
+        for access in ["RW", "RDONLY"] {
+            for offset in [0, 7] {
+                let line = format!("{access} 8 FLAT \"data.vmdk\" {offset}");
+                let path = write_descriptor(dir.as_path(), "monolithicFlat", &[&line]);
+                let end = (offset + 8) * SECTOR;
+                data.set_len(end - 1).unwrap();
+                let error = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap_err();
+                assert_eq!(error.kind(), BlockErrorKind::InvalidFormat);
+                data.set_len(end).unwrap();
+                VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn new_rejects_zero_sector_extent() {
         let dir = TempDir::new_with_prefix("/tmp/vmdk-zero-test").unwrap();
         let path = write_descriptor(
