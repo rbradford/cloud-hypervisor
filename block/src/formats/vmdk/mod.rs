@@ -215,6 +215,20 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_directory_need_not_be_utf8() {
+        use std::ffi::OsStr;
+        use std::fs;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-path-test").unwrap();
+        let parent = dir.as_path().join(OsStr::from_bytes(b"disk-\xff"));
+        fs::create_dir(&parent).unwrap();
+        let path = write_flat_vmdk(&parent, "monolithicFlat", &[("data.vmdk", "RW", 8)]);
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, true, false).unwrap();
+        assert_eq!(disk.logical_size().unwrap(), 8 * SECTOR);
+    }
+
+    #[test]
     fn logical_size_sums_multiple_extents() {
         let dir = TempDir::new_with_prefix("/tmp/vmdk-test").unwrap();
         let path = write_flat_vmdk(

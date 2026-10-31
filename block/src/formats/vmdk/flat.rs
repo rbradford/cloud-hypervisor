@@ -46,9 +46,8 @@ pub(crate) struct VmdkExtent {
     pub file_base_offset: u64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct FlatVmdk {
-    descriptor: Arc<VmdkDescriptor>,
     // Open handle to the VMDK descriptor file.
     descriptor_file: Arc<File>,
     // All opened data extents, in virtual-disk order.
@@ -113,13 +112,17 @@ fn extent_components(filename: &str) -> io::Result<Vec<&OsStr>> {
 // per-component openat walk. Both confine relative names beneath the
 // descriptor directory and reject a symlinked final component (O_NOFOLLOW).
 fn open_extent(
-    base_path: &str,
+    base_path: &Path,
     filename: &str,
     writable: bool,
     direct: bool,
 ) -> io::Result<AlignedFile> {
     let is_absolute = Path::new(filename).is_absolute();
-    let anchor = if is_absolute { "/" } else { base_path };
+    let anchor = if is_absolute {
+        Path::new("/")
+    } else {
+        base_path
+    };
 
     let dir = OpenOptions::new()
         .read(true)
@@ -331,7 +334,15 @@ fn overflow_error(what: &str) -> io::Error {
 impl FlatVmdk {
     /// Opens a flat VMDK image from its already-open descriptor file.
     pub(super) fn new(file: File, path: &Path, readonly: bool, direct: bool) -> io::Result<Self> {
-        let descriptor = VmdkDescriptor::new(&file, path)?;
+        let descriptor = VmdkDescriptor::new(&file)?;
+        let base_path = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Missing descriptor directory")
+        })?;
+        let base_path = if base_path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            base_path
+        };
 
         if descriptor.extents_list.extents.is_empty() {
             return Err(io::Error::new(
@@ -376,18 +387,12 @@ impl FlatVmdk {
             };
 
             let extent_file = match access {
-                ExtentAccess::ReadWrite => Some(open_extent(
-                    &descriptor.base_path,
-                    &extent.filename,
-                    true,
-                    direct,
-                )?),
-                ExtentAccess::ReadOnly => Some(open_extent(
-                    &descriptor.base_path,
-                    &extent.filename,
-                    false,
-                    direct,
-                )?),
+                ExtentAccess::ReadWrite => {
+                    Some(open_extent(base_path, &extent.filename, true, direct)?)
+                }
+                ExtentAccess::ReadOnly => {
+                    Some(open_extent(base_path, &extent.filename, false, direct)?)
+                }
                 ExtentAccess::NoAccess => None,
             };
 
@@ -408,7 +413,6 @@ impl FlatVmdk {
         let total_disk_size = virtual_start;
 
         Ok(Self {
-            descriptor: Arc::new(descriptor),
             descriptor_file: Arc::new(file),
             extents: Arc::new(extents),
             size: total_disk_size,
@@ -456,17 +460,6 @@ impl FlatVmdk {
 impl AsRawFd for FlatVmdk {
     fn as_raw_fd(&self) -> RawFd {
         self.descriptor_file.as_raw_fd()
-    }
-}
-
-impl Clone for FlatVmdk {
-    fn clone(&self) -> Self {
-        Self {
-            descriptor: Arc::clone(&self.descriptor),
-            descriptor_file: Arc::clone(&self.descriptor_file),
-            extents: Arc::clone(&self.extents),
-            size: self.size,
-        }
     }
 }
 
@@ -787,7 +780,7 @@ mod tests {
             check_walk(&walk_res, false);
         }
 
-        let err = open_extent(base.to_str().unwrap(), "../escape.vmdk", true, false).unwrap_err();
+        let err = open_extent(&base, "../escape.vmdk", true, false).unwrap_err();
         assert_eq!(
             err.raw_os_error(),
             Some(libc::EXDEV),

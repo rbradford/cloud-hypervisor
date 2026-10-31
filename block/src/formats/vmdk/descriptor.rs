@@ -11,7 +11,6 @@
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
 use std::str::{FromStr, Lines};
 
 use crate::AlignedFile;
@@ -86,29 +85,13 @@ pub(super) struct VmdkDescriptorExtents {
 }
 
 /// Parsed flat VMDK descriptor
-///
-/// extents_list: ordered extent list
-/// base_path: descriptor file's parent directory
 #[derive(Debug, Default)]
 pub(super) struct VmdkDescriptor {
-    pub base_path: String,
     pub extents_list: VmdkDescriptorExtents,
 }
 
 impl VmdkDescriptor {
-    pub(super) fn new(file: &File, path: &Path) -> io::Result<Self> {
-        // The descriptor's directory anchors the relative extent filenames.
-        let base_path = path
-            .parent()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Cannot retrieve parent directory of the file",
-                )
-            })?
-            .to_string_lossy()
-            .to_string();
-
+    pub(super) fn new(file: &File) -> io::Result<Self> {
         // Valid descriptor file must be much larger than 4 bytes.
         if file.metadata()?.len() < 4 {
             return Err(io::Error::new(
@@ -122,10 +105,7 @@ impl VmdkDescriptor {
         let (_header, last_line) = parse_header(&mut lines)?;
         let extents_list = parse_extents(&mut lines, last_line)?;
 
-        Ok(Self {
-            base_path,
-            extents_list,
-        })
+        Ok(Self { extents_list })
     }
 }
 
@@ -349,7 +329,7 @@ mod tests {
         let mut file: &File = tmp.as_file();
         file.write_all(body.as_bytes()).unwrap();
 
-        VmdkDescriptor::new(file, tmp.as_path()).unwrap_err();
+        VmdkDescriptor::new(file).unwrap_err();
         assert!(!is_flat_vmdk(&mut tmp.into_file()).unwrap());
     }
 
@@ -382,7 +362,7 @@ mod tests {
 
         // `read_descriptor` reads positionally (anchored at offset 0), so the
         // advanced offset must not affect the parse.
-        let descriptor = VmdkDescriptor::new(file, tmp.as_path()).unwrap();
+        let descriptor = VmdkDescriptor::new(file).unwrap();
         assert_eq!(descriptor.extents_list.extents.len(), 1);
         assert_eq!(
             descriptor.extents_list.extents[0].filename,
