@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use log::warn;
 
@@ -53,6 +53,7 @@ pub(super) struct FlatVmdk {
     // All opened data extents, in virtual-disk order.
     extents: Arc<Vec<VmdkExtent>>,
     size: u64,
+    pub(super) write_lock: Arc<Mutex<()>>,
 }
 
 #[repr(C)]
@@ -421,6 +422,7 @@ impl FlatVmdk {
             descriptor_file: Arc::new(file),
             extents: Arc::new(extents),
             size: total_disk_size,
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -472,6 +474,60 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn concurrent_writes_preserve_shared_alignment_blocks() {
+        use std::os::unix::fs::FileExt;
+        use std::sync::Barrier;
+        use std::thread;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::async_io::{AsyncIo, OwnedIoBuffer};
+        use crate::formats::vmdk::engine_sync::FlatVmdkSync;
+
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        let extents = (0..2)
+            .map(|index| VmdkExtent {
+                file: Some(AlignedFile::with_alignment(
+                    file.as_file().try_clone().unwrap(),
+                    Some(4096),
+                )),
+                access: ExtentAccess::ReadWrite,
+                virtual_start: index * 512,
+                length: 512,
+                file_base_offset: index * 512,
+            })
+            .collect();
+        let vmdk = FlatVmdk {
+            descriptor_file: Arc::new(TempFile::new().unwrap().into_file()),
+            extents: Arc::new(extents),
+            size: 1024,
+            write_lock: Arc::new(Mutex::new(())),
+        };
+
+        for _ in 0..64 {
+            file.as_file().write_all_at(&[0; 4096], 0).unwrap();
+            let barrier = Barrier::new(2);
+            thread::scope(|scope| {
+                for index in 0..2 {
+                    let mut worker = FlatVmdkSync::new(vmdk.clone());
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let buffer = OwnedIoBuffer::from_vec(vec![index as u8 + 1; 512]);
+                        barrier.wait();
+                        worker.write_from_vec(index * 512, buffer, 0).unwrap();
+                        assert_eq!(worker.next_completed_request().unwrap().result, 512);
+                    });
+                }
+            });
+            let mut data = [0; 1024];
+            file.as_file().read_exact_at(&mut data, 0).unwrap();
+            assert_eq!(data[..512], [1; 512]);
+            assert_eq!(data[512..], [2; 512]);
+        }
+    }
 
     #[test]
     fn extent_components_allows_bare_name() {

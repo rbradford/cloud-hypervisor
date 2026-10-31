@@ -207,6 +207,8 @@ impl AsyncIo for FlatVmdkSync {
             });
         }
 
+        let _write_lock = (!is_read && total != 0).then(|| self.vmdk.write_lock.lock().unwrap());
+
         let result = if total == 0 {
             Ok(0)
         } else if let Some(extent) = self.extent_at(start) {
@@ -248,6 +250,7 @@ impl AsyncIo for FlatVmdkSync {
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
+        let _write_lock = self.vmdk.write_lock.lock().unwrap();
         // Flush every extent: a single guest flush must durably persist data
         // that may have been written across multiple extent files.
         for extent in self.vmdk.extents() {
