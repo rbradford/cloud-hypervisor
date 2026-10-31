@@ -244,7 +244,7 @@ impl RegionInfo {
         let mut offset = 0;
         let mut region_entries = BTreeMap::new();
 
-        let mut buffer = [0; REGION_SIZE as usize];
+        let mut buffer = [0; REGION_SIZE as usize - size_of::<RegionTableHeader>()];
         // Read after the Region Table Header
         f.read_exact_at(
             &mut buffer,
@@ -888,7 +888,7 @@ mod tests {
 
         let temp = TempFile::new().unwrap();
         let f = temp.into_file();
-        f.set_len(entries_at + 64 * 1024).unwrap();
+        f.set_len(region_start + 64 * 1024).unwrap();
         f.write_all_at(&region_entry(BAT_GUID, u64::MAX, 0x1000), entries_at)
             .unwrap();
 
