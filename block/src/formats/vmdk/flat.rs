@@ -423,9 +423,8 @@ impl FlatVmdk {
         self.size
     }
 
-    /// Shared handle to the opened data extents, used to build the I/O worker.
-    pub(super) fn extents(&self) -> Arc<Vec<VmdkExtent>> {
-        Arc::clone(&self.extents)
+    pub(super) fn extents(&self) -> &[VmdkExtent] {
+        &self.extents
     }
 
     /// Host allocation size: the sum of every opened extent's actually

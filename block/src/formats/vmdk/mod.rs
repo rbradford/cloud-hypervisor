@@ -91,10 +91,7 @@ impl disk_file::AsyncDiskFile for VmdkDisk {
         // depth is unused here.
         let _ = ring_depth;
 
-        Ok(Box::new(FlatVmdkSync::new(
-            self.inner.extents(),
-            self.inner.virtual_block_size(),
-        )))
+        Ok(Box::new(FlatVmdkSync::new(self.inner.clone())))
     }
 }
 

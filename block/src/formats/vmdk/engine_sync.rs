@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
 use std::{cmp, io};
 
 use vmm_sys_util::eventfd::EventFd;
@@ -13,7 +12,7 @@ use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, CompletionCommon,
 };
 use crate::formats::vmdk::descriptor::ExtentAccess;
-use crate::formats::vmdk::flat::VmdkExtent;
+use crate::formats::vmdk::flat::{FlatVmdk, VmdkExtent};
 
 /// Synchronous, extent-aware I/O worker for flat VMDK images.
 ///
@@ -21,23 +20,22 @@ use crate::formats::vmdk::flat::VmdkExtent;
 ///
 /// Async backends (io_uring/AIO) are not supported.
 pub(crate) struct FlatVmdkSync {
-    extents: Arc<Vec<VmdkExtent>>,
-    size: u64,
+    vmdk: FlatVmdk,
     completions: CompletionCommon,
 }
 
 impl FlatVmdkSync {
-    pub(super) fn new(extents: Arc<Vec<VmdkExtent>>, size: u64) -> Self {
+    pub(super) fn new(vmdk: FlatVmdk) -> Self {
         FlatVmdkSync {
-            extents,
-            size,
+            vmdk,
             completions: CompletionCommon::new(),
         }
     }
 
     // Returns the extent containing virtual `offset`, or `None` if out of range.
     fn extent_at(&self, offset: u64) -> Option<&VmdkExtent> {
-        self.extents
+        self.vmdk
+            .extents()
             .iter()
             .find(|e| offset >= e.virtual_start && offset < e.virtual_start + e.length)
     }
@@ -192,19 +190,17 @@ impl AsyncIo for FlatVmdkSync {
     }
 
     fn submit_data_operation(&mut self, mut op: AsyncIoOperation) -> AsyncIoResult<()> {
+        let size = self.vmdk.virtual_block_size();
         let start = op.offset() as u64;
         let total = op.total_len() as u64;
         let is_read = op.is_read();
 
         // Bounds check against the virtual disk size (overflow-safe: `start`
         // is checked before subtracting it from `size`).
-        if start > self.size || total > self.size - start {
+        if start > size || total > size - start {
             let error = io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "VMDK request (start {start}, length {total}) exceeds virtual size {}",
-                    self.size
-                ),
+                format!("VMDK request (start {start}, length {total}) exceeds virtual size {size}"),
             );
             return Err(if is_read {
                 AsyncIoError::ReadVectored(error)
@@ -258,7 +254,7 @@ impl AsyncIo for FlatVmdkSync {
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
         // Flush every extent: a single guest flush must durably persist data
         // that may have been written across multiple extent files.
-        for extent in self.extents.iter() {
+        for extent in self.vmdk.extents() {
             // Skip NoAccess extents, which have no open file.
             if let Some(file) = extent.file.as_ref() {
                 file.sync_all().map_err(AsyncIoError::Fsync)?;
