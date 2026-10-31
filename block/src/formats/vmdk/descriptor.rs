@@ -9,16 +9,11 @@
 //! and `twoGbMaxExtentFlat` create types are recognized.
 
 use std::fs::File;
-use std::io;
 use std::os::unix::fs::FileExt;
 use std::str::{FromStr, Lines};
+use std::{io, iter};
 
 use crate::AlignedFile;
-
-const VMDK_DESCRIPTOR_HEADER: &str = "# Disk DescriptorFile";
-const VMDK_DESCRIPTOR_EXTENTS: &str = "# Extent description";
-const VMDK_DESCRIPTOR_DDB: &str = "# The Disk Data Base";
-const VMDK_DESCRIPTOR_DDB_2: &str = "#DDB";
 
 // The maximum allowed VMDK descriptor length.
 // Max matches QEMU's implementation.
@@ -134,25 +129,6 @@ impl VmdkDescriptor {
 fn read_descriptor(file: &File) -> io::Result<String> {
     let aligned = AlignedFile::new(file.try_clone()?, true);
 
-    // Confirm the descriptor header from a small prefix.
-    let mut head = [0u8; VMDK_DESCRIPTOR_HEADER.len()];
-    match aligned.read_exact_at(&mut head, 0) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid VMDK descriptor: the file is shorter than the header",
-            ));
-        }
-        Err(e) => return Err(e),
-    }
-    if !has_descriptor_header(&head) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid VMDK descriptor: the file is missing the descriptor header",
-        ));
-    }
-
     let len = file.metadata()?.len();
     if len > MAX_DESCRIPTOR_LEN {
         return Err(io::Error::new(
@@ -162,7 +138,11 @@ fn read_descriptor(file: &File) -> io::Result<String> {
     }
     let mut buf = vec![0u8; len as usize];
     aligned.read_exact_at(&mut buf, 0)?;
-    // A descriptor is ASCII text, so invalid UTF-8 means "not a descriptor".
+    // QEMU can leave padding or stale bytes after the text terminator.
+    if let Some(end) = buf.iter().position(|&byte| byte == 0) {
+        buf.truncate(end);
+    }
+    // Decode descriptor text as UTF-8.
     String::from_utf8(buf).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -172,30 +152,22 @@ fn read_descriptor(file: &File) -> io::Result<String> {
 }
 
 fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, &'a str)> {
-    let header_line = lines.next().unwrap_or_default();
-
-    // Reject actual disk data (or an embedded descriptor, which is
-    // unsupported): a flat descriptor must start with the header line.
-    if header_line.trim_end() != VMDK_DESCRIPTOR_HEADER {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Not a VMDK descriptor file: missing header: {header_line}"),
-        ));
-    }
-
     let mut header = VmdkDescriptorHeader::default();
-    let mut last_comment_line = "";
 
     for line in lines.by_ref() {
-        if line.starts_with('#') {
-            // End of the header section.
-            last_comment_line = line;
-            break;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-        let parts: Vec<&str> = line.split('=').map(|s| s.trim()).collect();
-        if parts.len() == 2 && parts[0] == "createType" {
+        let Some((key, value)) = line.split_once('=') else {
+            return Ok((header, line));
+        };
+        if key.trim().contains(char::is_whitespace) {
+            return Ok((header, line));
+        }
+        if key.trim() == "createType" {
             // Tools such as qemu-img quote the value, strip quotes for comparison.
-            header.create_type = match parts[1].trim_matches('"') {
+            header.create_type = match value.trim().trim_matches('"') {
                 "monolithicFlat" => VMDKDiskType::MonolithicFlat,
                 "twoGbMaxExtentFlat" => VMDKDiskType::TwoGbMaxExtentFlat,
                 _ => VMDKDiskType::CreateTypeUnsupported,
@@ -203,34 +175,19 @@ fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, 
         }
     }
 
-    Ok((header, last_comment_line))
+    Ok((header, ""))
 }
 
-fn parse_extents(
-    lines: &mut Lines<'_>,
-    last_comment_line: &str,
+fn parse_extents<'a>(
+    lines: &mut Lines<'a>,
+    first_line: &'a str,
 ) -> io::Result<VmdkDescriptorExtents> {
     let mut extents = VmdkDescriptorExtents::default();
 
-    if last_comment_line != VMDK_DESCRIPTOR_EXTENTS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Expected the extents section comment line",
-        ));
-    }
-
-    for line in lines.by_ref() {
-        if line.trim().is_empty() {
+    for line in iter::once(first_line).chain(lines.by_ref()) {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("ddb.") {
             continue;
-        }
-        if line.starts_with('#') {
-            if line == VMDK_DESCRIPTOR_DDB || line == VMDK_DESCRIPTOR_DDB_2 {
-                break;
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Expected the DDB section comment line",
-            ));
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() == 4 || parts.len() == 5 {
@@ -268,11 +225,6 @@ fn parse_extents(
     }
 
     Ok(extents)
-}
-
-/// Returns true when `prefix` begins with the `# Disk DescriptorFile` header.
-pub fn has_descriptor_header(prefix: &[u8]) -> bool {
-    prefix.starts_with(VMDK_DESCRIPTOR_HEADER.as_bytes())
 }
 
 /// Returns true for a supported flat VMDK: create type `monolithicFlat` or
@@ -367,6 +319,21 @@ mod tests {
     }
 
     #[test]
+    fn bytes_after_text_terminator_are_ignored() {
+        use vmm_sys_util::tempfile::TempFile;
+
+        for padding in [b"\0\0\0".as_slice(), b"\0\n", b"\0\xff\n"] {
+            let mut text = b"CID=1\nparentCID=ffffffff\ncreateType=monolithicFlat\n\
+                             NOACCESS 8 FLAT \"missing.vmdk\"\n"
+                .to_vec();
+            text.extend_from_slice(padding);
+            let mut file = TempFile::new().unwrap().into_file();
+            file.write_all_at(&text, 0).unwrap();
+            assert!(is_flat_vmdk(&mut file).unwrap());
+        }
+    }
+
+    #[test]
     fn single_flat_extent_with_ddb() {
         let body: &str = "RW 2097152 FLAT \"disk-flat.vmdk\"\n\
                           # The Disk Data Base\n\
@@ -423,10 +390,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_leading_comment() {
+    fn ignores_comments_before_extents() {
         let body: &str = "RW 2097152 FLAT \"disk-flat.vmdk\"\n";
-        // Must be told we are at "# Extent description", anything else errors.
-        parse_body("# The Disk Data Base", body).unwrap_err();
+        let extents = parse_body("# Another comment", body).unwrap();
+        assert_eq!(extents.extents.len(), 1);
     }
 
     #[test]
@@ -458,10 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unexpected_comment_in_body() {
+    fn ignores_comments_inside_extents() {
         let body: &str = "RW 2097152 FLAT \"disk-flat.vmdk\"\n\
                           # Some other comment\n";
-        parse_body("# Extent description", body).unwrap_err();
+        let extents = parse_body("# Extent description", body).unwrap();
+        assert_eq!(extents.extents.len(), 1);
     }
 
     #[test]
@@ -477,12 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_descriptor_header() {
-        let input: &str = "NOT_A_DESCRIPTOR\nversion=1\n";
-        parse_hdr(input).unwrap_err();
-    }
-
-    #[test]
     fn parses_header_fields() {
         let input: &str = "# Disk DescriptorFile\n\
                            version=1\n\
@@ -494,7 +456,7 @@ mod tests {
         let (header, last) = parse_hdr(input).unwrap();
 
         assert!(matches!(header.create_type, VMDKDiskType::MonolithicFlat));
-        assert_eq!(last, "# Extent description");
+        assert!(last.is_empty());
     }
 
     #[test]

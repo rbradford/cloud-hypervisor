@@ -549,15 +549,9 @@ pub fn validate_image_type(f: &mut File, image_type: ImageType) -> BlockResult<b
             BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::ValidateImageType)
         }),
         ImageType::Vhdx => Ok(u64::from_le_bytes(block[0..8].try_into().unwrap()) == VHDX_SIGN),
-        ImageType::FlatVmdk => {
-            if formats::vmdk::has_descriptor_header(&block) {
-                formats::vmdk::is_flat_vmdk(f).map_err(|e| {
-                    BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::ValidateImageType)
-                })
-            } else {
-                Ok(false)
-            }
-        }
+        ImageType::FlatVmdk => formats::vmdk::is_flat_vmdk(f).map_err(|e| {
+            BlockError::new(BlockErrorKind::Io, e).with_op(ErrorOp::ValidateImageType)
+        }),
         ImageType::Raw => Ok(true),
         ImageType::Unknown => Ok(false),
     }

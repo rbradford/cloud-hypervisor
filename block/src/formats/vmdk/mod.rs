@@ -16,7 +16,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-pub use descriptor::{has_descriptor_header, is_flat_vmdk};
+pub use descriptor::is_flat_vmdk;
 
 use self::engine_sync::FlatVmdkSync;
 use self::flat::FlatVmdk;
@@ -421,6 +421,29 @@ mod tests {
         let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
 
         disk.create_async_io(32).unwrap();
+    }
+
+    #[test]
+    fn comments_do_not_define_descriptor_sections() {
+        use std::os::unix::fs::FileExt;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::{ImageType, validate_image_type};
+
+        let text = " \n  # A descriptor comment\n\
+                    version = 1\nCID = fffffffe\nparentCID = ffffffff\n\
+                    createType = \"monolithicFlat\"\n\
+                    # Another comment\n\
+                    NOACCESS 8 FLAT \"missing.vmdk\" 0  \n\
+                    # Disk properties\n\
+                    ddb.adapterType = \"ide\"\n";
+        let file = TempFile::new().unwrap();
+        file.as_file().write_all_at(text.as_bytes(), 0).unwrap();
+        let mut descriptor = file.as_file().try_clone().unwrap();
+        assert!(validate_image_type(&mut descriptor, ImageType::FlatVmdk).unwrap());
+        let disk = VmdkDisk::new(descriptor, file.as_path(), false, false).unwrap();
+        assert_eq!(disk.logical_size().unwrap(), 8 * SECTOR);
     }
 
     #[test]
