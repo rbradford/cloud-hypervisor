@@ -117,6 +117,8 @@ pub(super) struct Vhdx {
     log_length: u32,
     disk_spec: DiskSpec,
     bat_entries: Vec<BatEntry>,
+    // Unused BAT offsets beyond the original EOF.
+    reserved_offsets: Vec<u64>,
     first_write: bool,
 }
 
@@ -155,8 +157,9 @@ impl Vhdx {
 
         let disk_spec =
             DiskSpec::new(&aligned, &mdr_entry).map_err(VhdxError::ParseVhdxMetadata)?;
-        let bat_entries = BatEntry::collect_bat_entries(&aligned, &disk_spec, &bat_entry)
-            .map_err(VhdxError::ReadBatEntry)?;
+        let (bat_entries, reserved_offsets) =
+            BatEntry::collect_bat_entries(&aligned, &disk_spec, &bat_entry)
+                .map_err(VhdxError::ReadBatEntry)?;
 
         Ok(Vhdx {
             aligned,
@@ -166,6 +169,7 @@ impl Vhdx {
             log_length,
             disk_spec,
             bat_entries,
+            reserved_offsets,
             first_write: true,
         })
     }
@@ -354,8 +358,19 @@ impl Vhdx {
                 | bat::PAYLOAD_BLOCK_UNMAPPED
                 | bat::PAYLOAD_BLOCK_ZERO => {
                     let block_size_min = metadata::BLOCK_SIZE_MIN as u64;
-                    let file_offset =
+                    let mut file_offset =
                         self.disk_spec.image_size.div_ceil(block_size_min) * block_size_min;
+                    let next = self
+                        .reserved_offsets
+                        .partition_point(|&offset| offset < file_offset);
+                    for &reserved in &self.reserved_offsets[next..] {
+                        if reserved != file_offset {
+                            break;
+                        }
+                        file_offset = file_offset
+                            .checked_add(block_size_min)
+                            .ok_or(VhdxIoError::InvalidDiskSize)?;
+                    }
                     let new_size = file_offset
                         .checked_add(self.disk_spec.block_size as u64)
                         .ok_or(VhdxIoError::InvalidDiskSize)?;
@@ -602,6 +617,92 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn payload_blocks_must_not_overlap() {
+        let Some(tf) = create_dynamic_vhdx(1024) else {
+            return;
+        };
+        let vhdx = open_vhdx(tf.as_path());
+        let start = vhdx.disk_spec.image_size.div_ceil(1 << 20) * (1 << 20);
+        let block_size = vhdx.disk_spec.block_size as u64;
+        let bat_offset = vhdx.regions.bat_entry.file_offset;
+        vhdx.aligned.file().set_len(start + 2 * block_size).unwrap();
+        BatEntry::write_bat_entry(
+            &vhdx.aligned,
+            bat_offset,
+            0,
+            start | PAYLOAD_BLOCK_FULLY_PRESENT,
+        )
+        .unwrap();
+        for delta in [0, 1 << 20, block_size] {
+            BatEntry::write_bat_entry(
+                &vhdx.aligned,
+                bat_offset,
+                1,
+                (start + delta) | PAYLOAD_BLOCK_FULLY_PRESENT,
+            )
+            .unwrap();
+            let result = Vhdx::new(vhdx.aligned.file().try_clone().unwrap(), false);
+            assert_eq!(result.is_err(), delta < block_size, "delta={delta}");
+        }
+    }
+
+    #[test]
+    fn allocation_preserves_reserved_offsets() {
+        let Some(tf) = create_dynamic_vhdx(1024) else {
+            return;
+        };
+        let vhdx = open_vhdx(tf.as_path());
+        let start = vhdx.disk_spec.image_size.div_ceil(1 << 20) * (1 << 20);
+        let bat_offset = vhdx.regions.bat_entry.file_offset;
+        for index in [1, 2] {
+            BatEntry::write_bat_entry(
+                &vhdx.aligned,
+                bat_offset,
+                index,
+                start | bat::PAYLOAD_BLOCK_ZERO,
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            Vhdx::new(vhdx.aligned.file().try_clone().unwrap(), false),
+            Err(VhdxError::ReadBatEntry(VhdxBatError::DuplicateFileOffset))
+        ));
+        BatEntry::write_bat_entry(
+            &vhdx.aligned,
+            bat_offset,
+            2,
+            (start + (1 << 20)) | bat::PAYLOAD_BLOCK_ZERO,
+        )
+        .unwrap();
+        BatEntry::write_bat_entry(
+            &vhdx.aligned,
+            bat_offset,
+            3,
+            bat::BAT_FILE_OFF_MASK | bat::PAYLOAD_BLOCK_ZERO,
+        )
+        .unwrap();
+
+        let mut vhdx = open_vhdx(tf.as_path());
+        for index in [1, 2, 3] {
+            let mut data = [0xff; 512];
+            vhdx.read_at(&mut data, index * vhdx.disk_spec.block_size as u64)
+                .unwrap();
+            assert_eq!(data, [0; 512]);
+        }
+        vhdx.write_all_at(&[0xa5; 512], 0).unwrap();
+        assert_eq!(
+            vhdx.bat_entries[0].0 & bat::BAT_FILE_OFF_MASK,
+            start + (2 << 20)
+        );
+        vhdx.flush().unwrap();
+
+        let reopened = open_vhdx(tf.as_path());
+        let mut data = [0; 512];
+        reopened.read_at(&mut data, 0).unwrap();
+        assert_eq!(data, [0xa5; 512]);
     }
 
     /// A VHDX image with an active log must be rejected until replay is
