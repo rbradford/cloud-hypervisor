@@ -742,6 +742,8 @@ mod tests {
         f.write_all(
             b"# Disk DescriptorFile\n\
               version=1\n\
+              CID=fffffffe\n\
+              parentCID=ffffffff\n\
               createType=\"monolithicFlat\"\n\
               # Extent description\n\
               RW 2048 FLAT \"disk-flat.vmdk\"\n\

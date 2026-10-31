@@ -153,6 +153,8 @@ fn read_descriptor(file: &File) -> io::Result<String> {
 
 fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, &'a str)> {
     let mut header = VmdkDescriptorHeader::default();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut first_extent = "";
 
     for line in lines.by_ref() {
         let line = line.trim();
@@ -160,17 +162,55 @@ fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, 
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            return Ok((header, line));
+            first_extent = line;
+            break;
         };
         if key.trim().contains(char::is_whitespace) {
-            return Ok((header, line));
+            first_extent = line;
+            break;
         }
-        if key.trim().eq_ignore_ascii_case("createType") {
-            let value = value.trim();
-            let value = value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .unwrap_or(value);
+        let key = key.trim();
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        if key.eq_ignore_ascii_case("version") {
+            if value != "1" {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Unsupported VMDK descriptor version '{value}'"),
+                ));
+            }
+        } else if key.eq_ignore_ascii_case("encoding") {
+            if !value.eq_ignore_ascii_case("UTF-8") {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Unsupported VMDK encoding '{value}'"),
+                ));
+            }
+        } else if key.eq_ignore_ascii_case("CID") || key.eq_ignore_ascii_case("parentCID") {
+            let cid = u32::from_str_radix(value, 16)
+                .ok()
+                .filter(|_| value.len() <= 8 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid VMDK {key} '{value}'"),
+                    )
+                })?;
+            if key.eq_ignore_ascii_case("parentCID") && cid != u32::MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "VMDK parent images are unsupported",
+                ));
+            }
+        } else if key.eq_ignore_ascii_case("parentFileNameHint") {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "VMDK parent images are unsupported",
+            ));
+        } else if key.eq_ignore_ascii_case("createType") {
             header.create_type = match value {
                 value if value.eq_ignore_ascii_case("monolithicFlat") => {
                     VMDKDiskType::MonolithicFlat
@@ -183,10 +223,30 @@ fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, 
                 }
                 _ => VMDKDiskType::CreateTypeUnsupported,
             };
+        } else {
+            continue;
         }
+        if seen
+            .iter()
+            .any(|previous| key.eq_ignore_ascii_case(previous))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Duplicate VMDK header field '{key}'"),
+            ));
+        }
+        seen.push(key);
     }
 
-    Ok((header, ""))
+    if !seen.iter().any(|key| key.eq_ignore_ascii_case("CID"))
+        || !seen.iter().any(|key| key.eq_ignore_ascii_case("parentCID"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Missing VMDK content identifier",
+        ));
+    }
+    Ok((header, first_extent))
 }
 
 fn parse_extents<'a>(
@@ -308,6 +368,8 @@ mod tests {
         // A minimal but complete monolithicFlat descriptor.
         let descriptor_text = "# Disk DescriptorFile\n\
                                version=1\n\
+                               CID=fffffffe\n\
+                               parentCID=ffffffff\n\
                                createType=monolithicFlat\n\
                                # Extent description\n\
                                RW 2097152 FLAT \"disk-flat.vmdk\"\n\
@@ -519,9 +581,59 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_or_unsupported_header_fields() {
+        use io::ErrorKind::{InvalidData, Unsupported};
+        use vmm_sys_util::tempfile::TempFile;
+
+        let header = "version=1\nCID=12345678\nparentCID=ffffffff\n\
+                      createType=monolithicFlat\n";
+        for (field, replacement, kind) in [
+            ("version=1", "version=2", Unsupported),
+            ("version=1", "version=3", Unsupported),
+            ("version=1", "encoding=\"windows-1252\"", Unsupported),
+            (
+                "version=1",
+                "parentFileNameHint=\"parent.vmdk\"",
+                Unsupported,
+            ),
+            ("parentCID=ffffffff", "parentCID=12345678", Unsupported),
+            ("CID=12345678", "", InvalidData),
+            ("parentCID=ffffffff", "", InvalidData),
+            ("CID=12345678", "CID=100000000", InvalidData),
+            ("CID=12345678", "CID=+1234567", InvalidData),
+            ("CID=12345678", "CID=not-hex", InvalidData),
+            ("parentCID=ffffffff", "parentCID=not-hex", InvalidData),
+            ("CID=12345678", "CID=12345678\ncid=9", InvalidData),
+            ("version=1", "version=1\nVERSION=1", InvalidData),
+            ("version=1", "encoding=UTF-8\nEncoding=UTF-8", InvalidData),
+            ("version=1", "parentCID=ffffffff", InvalidData),
+            ("version=1", "createType=twoGbMaxExtentFlat", InvalidData),
+        ] {
+            let text = header.replace(field, replacement) + "NOACCESS 8 FLAT \"missing.vmdk\"\n";
+            let mut file = TempFile::new().unwrap().into_file();
+            file.write_all_at(text.as_bytes(), 0).unwrap();
+            assert_eq!(VmdkDescriptor::new(&file).unwrap_err().kind(), kind);
+            assert!(!is_flat_vmdk(&mut file).unwrap());
+        }
+    }
+
+    #[test]
+    fn accepts_default_version_and_short_content_identifiers() {
+        for cid in ["0", "a", "01234567", "FFFFFFFF"] {
+            let text = format!(
+                "encoding=\"uTf-8\"\nCID={cid}\nparentCID=ffffffff\n\
+                 createType=monolithicFlat\n"
+            );
+            parse_hdr(&text).unwrap();
+        }
+    }
+
+    #[test]
     fn parses_quoted_create_type() {
         let input: &str = "# Disk DescriptorFile\n\
                            version=1\n\
+                           CID=fffffffe\n\
+                           parentCID=ffffffff\n\
                            createType=\"twoGbMaxExtentFlat\"\n\
                            # Extent description\n";
 
@@ -536,6 +648,8 @@ mod tests {
     fn full_monolithic_flat_descriptor() {
         let input: &str = "# Disk DescriptorFile\n\
                            version=1\n\
+                           CID=fffffffe\n\
+                           parentCID=ffffffff\n\
                            createType=monolithicFlat\n\
                            # Extent description\n\
                            RW 2097152 FLAT \"disk-flat.vmdk\"\n\
@@ -553,6 +667,8 @@ mod tests {
     fn full_two_gb_max_extent_flat_descriptor() {
         let input: &str = "# Disk DescriptorFile\n\
                            version=1\n\
+                           CID=fffffffe\n\
+                           parentCID=ffffffff\n\
                            createType=twoGbMaxExtentFlat\n\
                            # Extent description\n\
                            RW 4192256 FLAT \"disk-s001.vmdk\"\n\
