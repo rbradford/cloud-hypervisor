@@ -344,13 +344,6 @@ impl FlatVmdk {
             base_path
         };
 
-        if descriptor.extents_list.extents.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "VMDK descriptor lists no extents",
-            ));
-        }
-
         // Open every data extent and record the virtual-disk byte range it
         // backs.
         let mut extents: Vec<VmdkExtent> =

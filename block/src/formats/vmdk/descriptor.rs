@@ -102,8 +102,28 @@ impl VmdkDescriptor {
 
         let content = read_descriptor(file)?;
         let mut lines = content.lines();
-        let (_header, last_line) = parse_header(&mut lines)?;
+        let (header, last_line) = parse_header(&mut lines)?;
+        if matches!(header.create_type, VMDKDiskType::CreateTypeUnsupported) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported VMDK create type",
+            ));
+        }
         let extents_list = parse_extents(&mut lines, last_line)?;
+        if extents_list.extents.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VMDK descriptor lists no extents",
+            ));
+        }
+        for extent in &extents_list.extents {
+            if extent.extent_type != "FLAT" {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Unsupported VMDK extent type '{}'", extent.extent_type),
+                ));
+            }
+        }
 
         Ok(Self { extents_list })
     }
@@ -258,37 +278,13 @@ pub fn has_descriptor_header(prefix: &[u8]) -> bool {
 /// Returns true for a supported flat VMDK: create type `monolithicFlat` or
 /// `twoGbMaxExtentFlat` with only `FLAT` extents.
 pub fn is_flat_vmdk(f: &mut File) -> io::Result<bool> {
-    let content = match read_descriptor(f) {
-        Ok(content) => content,
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    let mut lines = content.lines();
-
-    let (header, last_line) = match parse_header(&mut lines) {
-        Ok(parsed) => parsed,
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(false),
-        Err(e) => return Err(e),
-    };
-
-    match header.create_type {
-        VMDKDiskType::MonolithicFlat | VMDKDiskType::TwoGbMaxExtentFlat => {}
-        _ => return Ok(false),
+    match VmdkDescriptor::new(f) {
+        Ok(_) => Ok(true),
+        Err(e) => match e.kind() {
+            io::ErrorKind::InvalidData | io::ErrorKind::Unsupported => Ok(false),
+            _ => Err(e),
+        },
     }
-
-    let extents = match parse_extents(&mut lines, last_line) {
-        Ok(extents) => extents,
-        Err(e) if e.kind() == io::ErrorKind::InvalidData => return Ok(false),
-        Err(e) => return Err(e),
-    };
-
-    for extent in &extents.extents {
-        if extent.extent_type != "FLAT" {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
 }
 
 #[cfg(test)]

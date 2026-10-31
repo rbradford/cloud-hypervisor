@@ -32,7 +32,14 @@ pub struct VmdkDisk {
 impl VmdkDisk {
     /// Builds a Flat VMDK disk backend.
     pub fn new(file: File, path: &Path, readonly: bool, direct: bool) -> Result<Self, BlockError> {
-        let inner = FlatVmdk::new(file, path, readonly, direct)?;
+        let inner = FlatVmdk::new(file, path, readonly, direct).map_err(|e| {
+            let kind = match e.kind() {
+                io::ErrorKind::InvalidData => BlockErrorKind::InvalidFormat,
+                io::ErrorKind::Unsupported => BlockErrorKind::UnsupportedFeature,
+                _ => BlockErrorKind::Io,
+            };
+            BlockError::new(kind, e).with_op(ErrorOp::Open)
+        })?;
         Ok(VmdkDisk { inner })
     }
 }
@@ -414,6 +421,29 @@ mod tests {
         let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
 
         disk.create_async_io(32).unwrap();
+    }
+
+    #[test]
+    fn unsupported_extents_are_rejected_before_open() {
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-format-test").unwrap();
+        for (create_type, extent_type) in [
+            ("monolithicSparse", "FLAT"),
+            ("monolithicFlat", "SPARSE"),
+            ("twoGbMaxExtentFlat", "VMFS"),
+        ] {
+            let line = format!("NOACCESS 8 {extent_type} \"missing.vmdk\"");
+            let path = write_descriptor(dir.as_path(), create_type, &[&line]);
+            let mut file = open_descriptor(&path);
+            assert!(!is_flat_vmdk(&mut file).unwrap());
+            let error = VmdkDisk::new(file, &path, false, false).unwrap_err();
+            assert_eq!(error.kind(), BlockErrorKind::UnsupportedFeature);
+        }
+
+        let path = write_descriptor(dir.as_path(), "monolithicFlat", &[]);
+        let mut file = open_descriptor(&path);
+        assert!(!is_flat_vmdk(&mut file).unwrap());
+        let error = VmdkDisk::new(file, &path, false, false).unwrap_err();
+        assert_eq!(error.kind(), BlockErrorKind::InvalidFormat);
     }
 
     #[test]
