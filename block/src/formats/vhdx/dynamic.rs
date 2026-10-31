@@ -123,10 +123,7 @@ impl Vhdx {
         let aligned = AlignedFile::new(file, direct_io);
 
         let vhdx_header = VhdxHeader::new(&aligned).map_err(VhdxError::ParseVhdxHeader)?;
-        if vhdx_header
-            .has_active_log()
-            .map_err(VhdxError::ParseVhdxHeader)?
-        {
+        if vhdx_header.has_active_log() {
             return Err(VhdxError::UnsupportedLogReplay);
         }
 
@@ -139,9 +136,7 @@ impl Vhdx {
 
         let bat_entry = collected_entries.bat_entry;
         let mdr_entry = collected_entries.mdr_entry;
-        let (log_offset, log_length) = vhdx_header
-            .log_region()
-            .map_err(VhdxError::ParseVhdxHeader)?;
+        let (log_offset, log_length) = vhdx_header.log_region();
 
         let disk_spec =
             DiskSpec::new(&aligned, &mdr_entry).map_err(VhdxError::ParseVhdxMetadata)?;
@@ -609,7 +604,7 @@ mod tests {
         assert!(status.success());
 
         let mut vhdx = open_vhdx(tf.as_path());
-        let (log_offset, _) = vhdx.vhdx_header.log_region().unwrap();
+        let (log_offset, _) = vhdx.vhdx_header.log_region();
         vhdx.bat_entries[0] =
             BatEntry(PAYLOAD_BLOCK_FULLY_PRESENT | (log_offset & bat::BAT_FILE_OFF_MASK));
 
