@@ -10,10 +10,10 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::replace;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Component, Path};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use log::warn;
 
@@ -53,7 +53,8 @@ pub(super) struct FlatVmdk {
     // All opened data extents, in virtual-disk order.
     extents: Arc<Vec<VmdkExtent>>,
     size: u64,
-    pub(super) write_lock: Arc<Mutex<()>>,
+    // Pending CID update, shared with the lock covering data writes.
+    pub(super) write_lock: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 #[repr(C)]
@@ -412,8 +413,25 @@ impl FlatVmdk {
             descriptor_file: Arc::new(file),
             extents: Arc::new(extents),
             size: total_disk_size,
-            write_lock: Arc::new(Mutex::new(())),
+            write_lock: Arc::new(Mutex::new(if readonly {
+                None
+            } else {
+                Some(descriptor.updated_content()?)
+            })),
         })
+    }
+
+    pub(super) fn begin_write(&self) -> io::Result<MutexGuard<'_, Option<Vec<u8>>>> {
+        let mut pending = self.write_lock.lock().unwrap();
+        if let Some(content) = pending.as_ref() {
+            let file = AlignedFile::new(self.descriptor_file.try_clone()?, true);
+            file.write_all_at(content, 0)?;
+            // Aligned writes can extend the text with padding.
+            file.set_len(content.len() as u64)?;
+            file.sync_all()?;
+            *pending = None;
+        }
+        Ok(pending)
     }
 
     pub(super) fn virtual_block_size(&self) -> u64 {
@@ -494,7 +512,7 @@ mod tests {
             descriptor_file: Arc::new(TempFile::new().unwrap().into_file()),
             extents: Arc::new(extents),
             size: 1024,
-            write_lock: Arc::new(Mutex::new(())),
+            write_lock: Arc::new(Mutex::new(None)),
         };
 
         for _ in 0..64 {

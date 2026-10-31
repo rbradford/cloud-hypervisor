@@ -207,7 +207,15 @@ impl AsyncIo for FlatVmdkSync {
             });
         }
 
-        let _write_lock = (!is_read && total != 0).then(|| self.vmdk.write_lock.lock().unwrap());
+        let _write_lock = if !is_read && total != 0 {
+            Some(
+                self.vmdk
+                    .begin_write()
+                    .map_err(AsyncIoError::WriteVectored)?,
+            )
+        } else {
+            None
+        };
 
         let result = if total == 0 {
             Ok(0)

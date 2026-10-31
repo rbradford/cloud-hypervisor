@@ -71,7 +71,7 @@ impl disk_file::Geometry for VmdkDisk {
 
 impl disk_file::SparseCapable for VmdkDisk {}
 
-// Flat VMDK keeps no in-memory format metadata, so no-op.
+// The CID is persisted before the first data write.
 impl disk_file::MetadataSync for VmdkDisk {}
 
 impl disk_file::Resizable for VmdkDisk {
@@ -174,7 +174,11 @@ mod tests {
     }
 
     fn open_descriptor(path: &Path) -> File {
-        File::open(path).unwrap()
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
     }
 
     // Writes a descriptor referencing `extent_lines` verbatim (no backing data
@@ -345,6 +349,100 @@ mod tests {
         let extents = disk.inner.extents();
         assert_eq!(extents[0].access, ExtentAccess::ReadWrite);
         assert!(extents[0].file.as_ref().unwrap().is_writable());
+    }
+
+    #[test]
+    fn cid_changes_once_before_data_writes() {
+        use std::fs;
+
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-cid-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "twoGbMaxExtentFlat",
+            &[
+                ("Data #=flat.vmdk", "RW", 8),
+                ("readonly.vmdk", "RDONLY", 8),
+            ],
+        );
+        let original = fs::read_to_string(&path)
+            .unwrap()
+            .replace("CID=fffffffe", "  cId = \"1\" ")
+            .replace('\n', "\r\n");
+        fs::write(&path, &original).unwrap();
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+        let mut first = disk.create_async_io(1).unwrap();
+        let mut second = disk.try_clone().unwrap().create_async_io(1).unwrap();
+        drop(disk);
+
+        first
+            .read_to_vec(0, OwnedIoBuffer::from_vec(vec![0; 512]), 0)
+            .unwrap();
+        assert_eq!(first.next_completed_request().unwrap().result, 512);
+        first
+            .write_from_vec(0, OwnedIoBuffer::from_vec(Vec::new()), 0)
+            .unwrap();
+        assert_eq!(first.next_completed_request().unwrap().result, 0);
+        first.fsync(None).unwrap();
+        for (offset, length) in [(-1, 512), (8192, 512), (3584, 1024), (4096, 512)] {
+            assert!(
+                first
+                    .write_from_vec(offset, OwnedIoBuffer::from_vec(vec![1; length]), 0)
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            fs::read(dir.as_path().join("Data #=flat.vmdk")).unwrap(),
+            vec![0; 4096]
+        );
+
+        first
+            .write_from_vec(0, OwnedIoBuffer::from_vec(vec![1; 512]), 0)
+            .unwrap();
+        assert_eq!(first.next_completed_request().unwrap().result, 512);
+        let updated = fs::read_to_string(&path).unwrap();
+        let cid = updated
+            .lines()
+            .find_map(|line| line.strip_prefix("CID="))
+            .unwrap();
+        assert_ne!(u32::from_str_radix(cid, 16).unwrap(), 1);
+        assert_eq!(
+            updated,
+            original.replace("  cId = \"1\" ", &format!("CID={cid}"))
+        );
+        second
+            .write_from_vec(512, OwnedIoBuffer::from_vec(vec![2; 512]), 0)
+            .unwrap();
+        assert_eq!(second.next_completed_request().unwrap().result, 512);
+        assert_eq!(fs::read_to_string(&path).unwrap(), updated);
+        let data = fs::read(dir.as_path().join("Data #=flat.vmdk")).unwrap();
+        assert_eq!(data[..512], [1; 512]);
+        assert_eq!(data[512..1024], [2; 512]);
+    }
+
+    #[test]
+    fn cid_write_failure_prevents_data_writes() {
+        use std::fs;
+
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-cid-error-test").unwrap();
+        let path = write_flat_vmdk(dir.as_path(), "monolithicFlat", &[("data.vmdk", "RW", 8)]);
+        let original = fs::read(&path).unwrap();
+        let disk = VmdkDisk::new(File::open(&path).unwrap(), &path, false, false).unwrap();
+        let pending = disk.inner.write_lock.lock().unwrap().clone();
+        let mut io = disk.create_async_io(1).unwrap();
+        for _ in 0..2 {
+            assert!(
+                io.write_from_vec(0, OwnedIoBuffer::from_vec(vec![1; 512]), 0)
+                    .is_err()
+            );
+            assert!(io.next_completed_request().is_none());
+            assert_eq!(*disk.inner.write_lock.lock().unwrap(), pending);
+        }
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read(dir.as_path().join("data.vmdk")).unwrap(),
+            vec![0; 4096]
+        );
     }
 
     #[test]

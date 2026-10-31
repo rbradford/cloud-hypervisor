@@ -71,6 +71,7 @@ pub(super) struct VmdkExtentHeader {
 #[derive(Debug, Default)]
 struct VmdkDescriptorHeader {
     pub create_type: VMDKDiskType,
+    pub cid: u32,
 }
 
 /// Ordered list of extents.
@@ -83,6 +84,8 @@ pub(super) struct VmdkDescriptorExtents {
 #[derive(Debug, Default)]
 pub(super) struct VmdkDescriptor {
     pub extents_list: VmdkDescriptorExtents,
+    content: String,
+    cid: u32,
 }
 
 impl VmdkDescriptor {
@@ -142,7 +145,40 @@ impl VmdkDescriptor {
             }
         }
 
-        Ok(Self { extents_list })
+        Ok(Self {
+            extents_list,
+            content,
+            cid: header.cid,
+        })
+    }
+
+    pub(super) fn updated_content(mut self) -> io::Result<Vec<u8>> {
+        let mut cid = uuid::Uuid::new_v4().as_u128() as u32;
+        if cid == self.cid {
+            cid = cid.wrapping_add(1);
+        }
+        let mut start = 0;
+        for line in self.content.split_inclusive('\n') {
+            if let Some((key, _)) = line.split_once('=')
+                && key.trim().eq_ignore_ascii_case("CID")
+            {
+                let end = start + line.trim_end_matches(['\r', '\n']).len();
+                self.content
+                    .replace_range(start..end, &format!("CID={cid:08x}"));
+                if self.content.len() as u64 > MAX_DESCRIPTOR_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Updated VMDK descriptor exceeds the maximum size",
+                    ));
+                }
+                return Ok(self.content.into_bytes());
+            }
+            start += line.len();
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Missing VMDK content identifier",
+        ))
     }
 }
 
@@ -226,6 +262,9 @@ fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, 
                     io::ErrorKind::Unsupported,
                     "VMDK parent images are unsupported",
                 ));
+            }
+            if key.eq_ignore_ascii_case("CID") {
+                header.cid = cid;
             }
         } else if key.eq_ignore_ascii_case("parentFileNameHint") {
             return Err(io::Error::new(
@@ -379,6 +418,26 @@ mod tests {
 
         VmdkDescriptor::new(file).unwrap_err();
         assert!(!is_flat_vmdk(&mut tmp.into_file()).unwrap());
+    }
+
+    #[test]
+    fn cid_update_respects_descriptor_size_limit() {
+        use vmm_sys_util::tempfile::TempFile;
+
+        for cid in ["1", "12345678"] {
+            let mut text = format!(
+                "CID={cid}\nparentCID=ffffffff\ncreateType=monolithicFlat\n\
+                 NOACCESS 8 FLAT \"missing.vmdk\"\n#"
+            );
+            text.extend(iter::repeat_n(
+                ' ',
+                MAX_DESCRIPTOR_LEN as usize - text.len(),
+            ));
+            let file = TempFile::new().unwrap();
+            file.as_file().write_all_at(text.as_bytes(), 0).unwrap();
+            let descriptor = VmdkDescriptor::new(file.as_file()).unwrap();
+            assert_eq!(descriptor.updated_content().is_ok(), cid.len() == 8);
+        }
     }
 
     #[test]
