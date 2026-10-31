@@ -488,6 +488,29 @@ mod tests {
     }
 
     #[test]
+    fn short_reads_do_not_complete_successfully() {
+        use crate::async_io::AsyncIoError;
+
+        let dir = TempDir::new_with_prefix("/tmp/vmdk-short-test").unwrap();
+        let path = write_flat_vmdk(
+            dir.as_path(),
+            "twoGbMaxExtentFlat",
+            &[("a.vmdk", "RW", 8), ("b.vmdk", "RW", 8)],
+        );
+        let disk = VmdkDisk::new(open_descriptor(&path), &path, false, false).unwrap();
+        File::create(dir.as_path().join("b.vmdk")).unwrap();
+        let mut io = disk.create_async_io(1).unwrap();
+        for (offset, length) in [(4096, 512), (3584, 1024)] {
+            let buffer = OwnedIoBuffer::from_vec(vec![0; length]);
+            let error = io.read_to_vec(offset, buffer, 0).unwrap_err();
+            assert!(
+                matches!(error, AsyncIoError::ReadVectored(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+            );
+            assert!(io.next_completed_request().is_none());
+        }
+    }
+
+    #[test]
     fn new_rejects_zero_sector_extent() {
         let dir = TempDir::new_with_prefix("/tmp/vmdk-zero-test").unwrap();
         let path = write_descriptor(

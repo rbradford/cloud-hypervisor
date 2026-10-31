@@ -224,6 +224,16 @@ impl AsyncIo for FlatVmdkSync {
             ))
         };
 
+        let result = result.and_then(|bytes| {
+            if bytes as u64 != total {
+                return Err(io::Error::from(if is_read {
+                    io::ErrorKind::UnexpectedEof
+                } else {
+                    io::ErrorKind::WriteZero
+                }));
+            }
+            Ok(bytes)
+        });
         let bytes = result.map_err(|e| {
             if is_read {
                 AsyncIoError::ReadVectored(e)
