@@ -10,7 +10,7 @@ use remain::sorted;
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use super::header::RegionTableEntry;
+use super::header::{RegionTableEntry, ranges_overlap};
 use crate::aligned_file::AlignedFile;
 
 const METADATA_SIGN: u64 = 0x6174_6164_6174_656D;
@@ -85,6 +85,8 @@ pub enum VhdxMetadataError {
     InvalidValue,
     #[error("Not all required metadata found")]
     MissingMetadata,
+    #[error("Overlapping metadata items")]
+    OverlappingMetadata,
     #[error("Failed to read metadata headers {0}")]
     ReadMetadata(#[source] io::Error),
     #[error("Reserved region has non-zero value")]
@@ -118,6 +120,7 @@ impl DiskSpec {
         }
         let mut disk_spec = DiskSpec::default();
         let mut metadata_presence: u16 = 0;
+        let mut item_ranges = Vec::new();
         let mut offset = 0;
         let metadata = f
             .file()
@@ -137,10 +140,18 @@ impl DiskSpec {
             let metadata_entry =
                 MetadataTableEntry::new(&buffer[offset..offset + size_of::<MetadataTableEntry>()])?;
 
-            let entry_end = u64::from(metadata_entry.offset) + u64::from(metadata_entry.length);
+            let entry_start = u64::from(metadata_entry.offset);
+            let entry_end = entry_start + u64::from(metadata_entry.length);
             if entry_end > metadata_region.length as u64 {
                 return Err(VhdxMetadataError::InvalidMetadataLength);
             }
+            if item_ranges
+                .iter()
+                .any(|&(start, end)| ranges_overlap(entry_start, entry_end, start, end))
+            {
+                return Err(VhdxMetadataError::OverlappingMetadata);
+            }
+            item_ranges.push((entry_start, entry_end));
 
             let presence = if metadata_entry.item_id == METADATA_FILE_PARAMETER {
                 let item = metadata_entry.read_item::<8>(f, metadata_region.file_offset)?;
@@ -431,5 +442,23 @@ mod tests {
             .unwrap();
             DiskSpec::new(&file, &region).unwrap();
         }
+    }
+
+    #[test]
+    fn overlapping_metadata_items_are_rejected() {
+        let Some((file, region)) = metadata_region() else {
+            return;
+        };
+        let (_, logical_offset) = metadata_item(&file, &region, METADATA_LOGICAL_SECTOR_SIZE);
+        let (physical_entry, _) = metadata_item(&file, &region, METADATA_PHYSICAL_SECTOR_SIZE);
+        file.write_all_at(
+            &((logical_offset - region.file_offset) as u32).to_le_bytes(),
+            physical_entry + 16,
+        )
+        .unwrap();
+        assert!(matches!(
+            DiskSpec::new(&file, &region),
+            Err(VhdxMetadataError::OverlappingMetadata)
+        ));
     }
 }
