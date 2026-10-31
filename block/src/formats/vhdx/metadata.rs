@@ -25,6 +25,7 @@ const METADATA_FLAGS_IS_REQUIRED: u32 = 0x04;
 pub(super) const BLOCK_SIZE_MIN: u32 = 1 << 20; // 1 MiB
 const BLOCK_SIZE_MAX: u32 = 256 << 20; // 256 MiB
 const MAX_SECTORS_PER_BLOCK: u64 = 1 << 23;
+const VIRTUAL_DISK_SIZE_MAX: u64 = 64 << 40; // 64 TiB
 
 const BLOCK_HAS_PARENT: u32 = 0x02; // Has a parent or a backing file
 
@@ -230,10 +231,7 @@ impl DiskSpec {
         if metadata_presence != METADATA_ALL_PRESENT {
             return Err(VhdxMetadataError::MissingMetadata);
         }
-        // Make sure virtual disk size is not zero
-        if (metadata_presence & METADATA_VIRTUAL_DISK_SIZE_PRESENT != 0)
-            && disk_spec.virtual_disk_size == 0
-        {
+        if disk_spec.virtual_disk_size == 0 || disk_spec.virtual_disk_size > VIRTUAL_DISK_SIZE_MAX {
             return Err(VhdxMetadataError::InvalidDiskSize(
                 disk_spec.virtual_disk_size,
             ));
@@ -531,5 +529,26 @@ mod tests {
                 .unwrap();
         }
         DiskSpec::new(&file, &region).unwrap();
+    }
+
+    #[test]
+    fn virtual_disk_size_is_checked() {
+        let Some((file, region)) = metadata_region() else {
+            return;
+        };
+        let (_, item_offset) = metadata_item(&file, &region, METADATA_VIRTUAL_DISK_SIZE);
+        for size in [0, VIRTUAL_DISK_SIZE_MAX + 512, u64::MAX] {
+            file.write_all_at(&size.to_le_bytes(), item_offset).unwrap();
+            assert!(matches!(
+                DiskSpec::new(&file, &region),
+                Err(VhdxMetadataError::InvalidDiskSize(_))
+            ));
+        }
+        file.write_all_at(&VIRTUAL_DISK_SIZE_MAX.to_le_bytes(), item_offset)
+            .unwrap();
+        assert_eq!(
+            DiskSpec::new(&file, &region).unwrap().virtual_disk_size,
+            VIRTUAL_DISK_SIZE_MAX
+        );
     }
 }
