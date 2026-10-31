@@ -44,12 +44,12 @@ impl FromStr for ExtentAccess {
 
     fn from_str(token: &str) -> Result<Self, Self::Err> {
         match token {
-            "RW" => Ok(Self::ReadWrite),
-            "RDONLY" => Ok(Self::ReadOnly),
-            "NOACCESS" => Ok(Self::NoAccess),
+            mode if mode.eq_ignore_ascii_case("RW") => Ok(Self::ReadWrite),
+            mode if mode.eq_ignore_ascii_case("RDONLY") => Ok(Self::ReadOnly),
+            mode if mode.eq_ignore_ascii_case("NOACCESS") => Ok(Self::NoAccess),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported VMDK extent access mode '{other}'"),
+                format!("Unsupported VMDK extent access mode '{other}'"),
             )),
         }
     }
@@ -112,7 +112,7 @@ impl VmdkDescriptor {
             ));
         }
         for extent in &extents_list.extents {
-            if extent.extent_type != "FLAT" {
+            if !extent.extent_type.eq_ignore_ascii_case("FLAT") {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!("Unsupported VMDK extent type '{}'", extent.extent_type),
@@ -165,11 +165,22 @@ fn parse_header<'a>(lines: &mut Lines<'a>) -> io::Result<(VmdkDescriptorHeader, 
         if key.trim().contains(char::is_whitespace) {
             return Ok((header, line));
         }
-        if key.trim() == "createType" {
-            // Tools such as qemu-img quote the value, strip quotes for comparison.
-            header.create_type = match value.trim().trim_matches('"') {
-                "monolithicFlat" => VMDKDiskType::MonolithicFlat,
-                "twoGbMaxExtentFlat" => VMDKDiskType::TwoGbMaxExtentFlat,
+        if key.trim().eq_ignore_ascii_case("createType") {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value);
+            header.create_type = match value {
+                value if value.eq_ignore_ascii_case("monolithicFlat") => {
+                    VMDKDiskType::MonolithicFlat
+                }
+                value
+                    if value.eq_ignore_ascii_case("twoGbMaxExtentFlat")
+                        || value.eq_ignore_ascii_case("2GbMaxExtentFlat") =>
+                {
+                    VMDKDiskType::TwoGbMaxExtentFlat
+                }
                 _ => VMDKDiskType::CreateTypeUnsupported,
             };
         }
@@ -186,7 +197,12 @@ fn parse_extents<'a>(
 
     for line in iter::once(first_line).chain(lines.by_ref()) {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with("ddb.") {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ddb."))
+        {
             continue;
         }
         let invalid_extent =
@@ -396,6 +412,31 @@ mod tests {
         let body: &str = "RW 2097152 FLAT \"disk-flat.vmdk\"\n";
         let extents = parse_body("# Another comment", body).unwrap();
         assert_eq!(extents.extents.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_keywords_are_case_insensitive() {
+        use vmm_sys_util::tempfile::TempFile;
+
+        for (create_type, access, expected) in [
+            ("MONOLITHICFLAT", "rw", ExtentAccess::ReadWrite),
+            ("tWoGbMaxExtentFlat", "rDoNlY", ExtentAccess::ReadOnly),
+            ("2GBMaxExtentFlat", "noaccess", ExtentAccess::NoAccess),
+        ] {
+            let text = format!(
+                "VERSION=1\nCiD=fffffffe\nPARENTCID=ffffffff\n\
+                 CREATETYPE=\"{create_type}\"\n\
+                 {access} 8 fLaT \"Mixed Case.vmdk\" 0\n\
+                 DDB.adapterType=\"ide\"\n"
+            );
+            let mut file = TempFile::new().unwrap().into_file();
+            file.write_all_at(text.as_bytes(), 0).unwrap();
+            let descriptor = VmdkDescriptor::new(&file).unwrap();
+            let extent = &descriptor.extents_list.extents[0];
+            assert_eq!(extent.access, expected);
+            assert_eq!(extent.filename, "Mixed Case.vmdk");
+            assert!(is_flat_vmdk(&mut file).unwrap());
+        }
     }
 
     #[test]
