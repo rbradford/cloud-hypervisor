@@ -76,9 +76,12 @@ impl Sector {
         sector_index: u64,
         sector_count: u64,
     ) -> result::Result<Sector, VhdxIoError> {
-        let mut sector = Sector::default();
-
-        sector.bat_index = sector_index / disk_spec.sectors_per_block as u64;
+        let payload_index = sector_index / disk_spec.sectors_per_block as u64;
+        // Skip the sector bitmap entry after each chunk.
+        let mut sector = Sector {
+            bat_index: payload_index + payload_index / disk_spec.chunk_ratio,
+            ..Default::default()
+        };
         sector.block_offset = sector_index % disk_spec.sectors_per_block as u64;
         sector.free_sectors = disk_spec.sectors_per_block as u64 - sector.block_offset;
         if sector.free_sectors > sector_count {
@@ -440,6 +443,28 @@ mod tests {
             .open(path)
             .unwrap();
         Vhdx::new(file, false).unwrap()
+    }
+
+    #[test]
+    fn sector_translation_skips_bitmap_entries() {
+        let spec = DiskSpec {
+            logical_sector_size: 512,
+            sectors_per_block: 2048,
+            chunk_ratio: 4096,
+            ..Default::default()
+        };
+        let bat = vec![BatEntry(0); 8195];
+        for (sector_index, bat_index, block_offset) in [
+            ((1 << 23) - 1, 4095, (1 << 20) - 512),
+            (1 << 23, 4097, 0),
+            ((1 << 23) + 1, 4097, 512),
+            (1 << 24, 8194, 0),
+        ] {
+            let sector = Sector::new(&spec, &bat, sector_index, 1).unwrap();
+            assert_eq!(sector.bat_index, bat_index);
+            assert_eq!(sector.block_offset, block_offset);
+            assert_eq!(sector.free_bytes, 512);
+        }
     }
 
     #[test]
