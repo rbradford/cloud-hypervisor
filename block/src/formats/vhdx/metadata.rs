@@ -134,12 +134,8 @@ impl DiskSpec {
             let metadata_entry =
                 MetadataTableEntry::new(&buffer[offset..offset + size_of::<MetadataTableEntry>()])?;
 
-            let item_offset = metadata_region.file_offset + metadata_entry.offset as u64;
-
             if metadata_entry.item_id == METADATA_FILE_PARAMETER {
-                let mut item = [0u8; 2 * size_of::<u32>()];
-                f.read_exact_at(&mut item, item_offset)
-                    .map_err(VhdxMetadataError::ReadMetadata)?;
+                let item = metadata_entry.read_item::<8>(f, metadata_region.file_offset)?;
                 disk_spec.block_size = LittleEndian::read_u32(&item[0..4]);
 
                 // MUST be at least 1 MiB and not greater than 256 MiB
@@ -157,23 +153,17 @@ impl DiskSpec {
 
                 metadata_presence |= METADATA_FILE_PARAMETER_PRESENT;
             } else if metadata_entry.item_id == METADATA_VIRTUAL_DISK_SIZE {
-                let mut item = [0u8; size_of::<u64>()];
-                f.read_exact_at(&mut item, item_offset)
-                    .map_err(VhdxMetadataError::ReadMetadata)?;
+                let item = metadata_entry.read_item::<8>(f, metadata_region.file_offset)?;
                 disk_spec.virtual_disk_size = LittleEndian::read_u64(&item);
 
                 metadata_presence |= METADATA_VIRTUAL_DISK_SIZE_PRESENT;
             } else if metadata_entry.item_id == METADATA_VIRTUAL_DISK_ID {
-                let mut item = [0u8; size_of::<u128>()];
-                f.read_exact_at(&mut item, item_offset)
-                    .map_err(VhdxMetadataError::ReadMetadata)?;
+                let item = metadata_entry.read_item::<16>(f, metadata_region.file_offset)?;
                 disk_spec.disk_id = LittleEndian::read_u128(&item);
 
                 metadata_presence |= METADATA_VIRTUAL_DISK_ID_PRESENT;
             } else if metadata_entry.item_id == METADATA_LOGICAL_SECTOR_SIZE {
-                let mut item = [0u8; size_of::<u32>()];
-                f.read_exact_at(&mut item, item_offset)
-                    .map_err(VhdxMetadataError::ReadMetadata)?;
+                let item = metadata_entry.read_item::<4>(f, metadata_region.file_offset)?;
                 disk_spec.logical_sector_size = LittleEndian::read_u32(&item);
                 if disk_spec.logical_sector_size != 512 {
                     return Err(VhdxMetadataError::InvalidLogicalSectorSize);
@@ -181,9 +171,7 @@ impl DiskSpec {
 
                 metadata_presence |= METADATA_LOGICAL_SECTOR_SIZE_PRESENT;
             } else if metadata_entry.item_id == METADATA_PHYSICAL_SECTOR_SIZE {
-                let mut item = [0u8; size_of::<u32>()];
-                f.read_exact_at(&mut item, item_offset)
-                    .map_err(VhdxMetadataError::ReadMetadata)?;
+                let item = metadata_entry.read_item::<4>(f, metadata_region.file_offset)?;
                 disk_spec.physical_sector_size = LittleEndian::read_u32(&item);
                 if !(disk_spec.physical_sector_size == 512
                     || disk_spec.physical_sector_size == 4096)
@@ -299,6 +287,14 @@ pub(super) struct MetadataTableEntry {
 }
 
 impl MetadataTableEntry {
+    fn read_item<const N: usize>(&self, f: &AlignedFile, region_offset: u64) -> Result<[u8; N]> {
+        let offset = region_offset + self.offset as u64;
+        let mut item = [0u8; N];
+        f.read_exact_at(&mut item, offset)
+            .map_err(VhdxMetadataError::ReadMetadata)?;
+        Ok(item)
+    }
+
     /// Parse one metadata entry from the buffer
     fn new(buffer: &[u8]) -> Result<MetadataTableEntry> {
         let metadata_table_entry = MetadataTableEntry::read_from_bytes(buffer).unwrap();
