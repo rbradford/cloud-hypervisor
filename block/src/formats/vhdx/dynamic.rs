@@ -14,6 +14,7 @@ use thiserror::Error;
 use super::bat::{self, BatEntry, VhdxBatError};
 use super::header::{self, RegionInfo, VhdxHeader, VhdxHeaderError};
 use super::metadata::{self, DiskSpec, VhdxMetadataError};
+use crate::DiskTopology;
 use crate::aligned_file::AlignedFile;
 
 #[sorted]
@@ -171,6 +172,14 @@ impl Vhdx {
 
     pub(super) fn virtual_disk_size(&self) -> u64 {
         self.disk_spec.virtual_disk_size
+    }
+
+    pub(super) fn topology(&self) -> DiskTopology {
+        DiskTopology {
+            logical_block_size: self.disk_spec.logical_sector_size as u64,
+            physical_block_size: self.disk_spec.physical_sector_size as u64,
+            ..Default::default()
+        }
     }
 
     /// Check that a payload block does not overlap reserved space.

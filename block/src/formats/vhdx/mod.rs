@@ -28,7 +28,7 @@ use self::dynamic::Vhdx;
 use self::engine_sync::VhdxSync;
 use crate::async_io::{AsyncIo, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
-use crate::{Error, disk_file};
+use crate::{DiskTopology, Error, disk_file};
 
 #[derive(Debug)]
 pub struct VhdxDisk {
@@ -87,7 +87,11 @@ impl disk_file::DiskFd for VhdxDisk {
     }
 }
 
-impl disk_file::Geometry for VhdxDisk {}
+impl disk_file::Geometry for VhdxDisk {
+    fn topology(&self) -> DiskTopology {
+        self.vhdx_file.lock().unwrap().topology()
+    }
+}
 
 impl disk_file::SparseCapable for VhdxDisk {}
 

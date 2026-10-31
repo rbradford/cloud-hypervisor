@@ -556,6 +556,23 @@ mod tests {
     }
 
     #[test]
+    fn physical_sector_size_is_exposed() {
+        use crate::disk_file::Geometry;
+        use crate::formats::vhdx::VhdxDisk;
+
+        let Some((file, region)) = metadata_region() else {
+            return;
+        };
+        let (_, item_offset) = metadata_item(&file, &region, METADATA_PHYSICAL_SECTOR_SIZE);
+        for size in [512u32, 4096] {
+            file.write_all_at(&size.to_le_bytes(), item_offset).unwrap();
+            let disk = VhdxDisk::new(file.file().try_clone().unwrap(), false).unwrap();
+            assert_eq!(disk.topology().physical_block_size, u64::from(size));
+            assert_eq!(disk.topology().logical_block_size, 512);
+        }
+    }
+
+    #[test]
     fn reserved_metadata_fields_are_checked() {
         let Some((file, region)) = metadata_region() else {
             return;
