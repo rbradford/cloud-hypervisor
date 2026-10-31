@@ -467,6 +467,7 @@ impl FlatVmdk {
                 })
             })
             .unwrap_or_default()
+            .with_block_size(VMDK_SECTOR_SIZE)
     }
 }
 
