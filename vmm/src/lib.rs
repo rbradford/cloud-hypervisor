@@ -2954,6 +2954,11 @@ impl RequestHandler for Vmm {
                 config.cpus.boot_vcpus = desired_vcpus;
             }
             if let Some(desired_ram) = desired_ram {
+                if config.memory.zones.is_some() {
+                    return Err(VmError::MemoryManager(
+                        memory_manager::Error::InvalidResizeWithMemoryZones,
+                    ));
+                }
                 // A running VM stores the hotplugged virtio-mem memory separately
                 if matches!(self.vm, VmOwnership::Owned(_))
                     && config.memory.hotplug_method == HotplugMethod::VirtioMem
@@ -3984,6 +3989,34 @@ mod tests {
         assert_eq!(
             config.lock().unwrap().balloon.as_ref().unwrap().size,
             256 << 20
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_resize_with_memory_zones() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.cpus.max_vcpus = 2;
+        config.memory = MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=512M"])).unwrap();
+        config.balloon = Some(BalloonConfig::parse("size=128M").unwrap());
+        vmm.vm_create(config).unwrap();
+        let config = vmm.vm_config.clone().unwrap();
+        let original_config = config.lock().unwrap().clone();
+
+        assert!(matches!(
+            vmm.vm_resize(Some(2), Some(1 << 30), Some(256 << 20)),
+            Err(VmError::MemoryManager(
+                memory_manager::Error::InvalidResizeWithMemoryZones
+            ))
+        ));
+        assert_eq!(*config.lock().unwrap(), original_config);
+
+        vmm.vm_resize(Some(2), None, Some(256 << 20)).unwrap();
+        config.lock().unwrap().validate().unwrap();
+        vmm.vm_resize_zone("mem0".to_string(), 1 << 30).unwrap();
+        assert_eq!(
+            config.lock().unwrap().memory.zones.as_ref().unwrap()[0].size,
+            1 << 30
         );
     }
 
