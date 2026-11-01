@@ -3993,6 +3993,141 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    fn test_vmm_vm_resize_balloon_failure() {
+        use std::sync::atomic::AtomicU8;
+
+        use virtio_devices::{ActivationContext, VirtioInterrupt, VirtioInterruptType};
+
+        use crate::device_manager::{DeviceManagerError, PciDeviceHandle};
+
+        struct FailingInterrupt;
+
+        impl VirtioInterrupt for FailingInterrupt {
+            fn trigger(&self, _: VirtioInterruptType) -> io::Result<()> {
+                Err(io::Error::other("Injected balloon interrupt failure"))
+            }
+
+            fn set_notifier(
+                &self,
+                _: u32,
+                _: Option<EventFd>,
+                _: &dyn hypervisor::Vm,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.memory = MemoryConfig::parse("size=128M,hotplug_size=128M", None).unwrap();
+        config.balloon = Some(BalloonConfig::parse("size=96M,id=balloon0").unwrap());
+        vmm.vm_create(config).unwrap();
+        let config = vmm.vm_config.clone().unwrap();
+        let vm = Vm::new(
+            Arc::clone(&config),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            #[cfg(feature = "guest_debug")]
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            &SeccompAction::Allow,
+            Arc::clone(&vmm.hypervisor),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            vmm.console_info.clone(),
+            None,
+            Arc::new(Mutex::new(None)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let device_tree = vm.device_manager().lock().unwrap().device_tree();
+        let balloon = {
+            let device_tree = device_tree.lock().unwrap();
+            let parent = device_tree
+                .get("balloon0")
+                .unwrap()
+                .parent
+                .as_ref()
+                .unwrap();
+            let Some(PciDeviceHandle::Virtio(device)) =
+                &device_tree.get(parent).unwrap().pci_device_handle
+            else {
+                unreachable!("Missing balloon PCI device");
+            };
+            device.lock().unwrap().virtio_device()
+        };
+        // No queue events are signalled: only config interrupt delivery is tested.
+        balloon
+            .lock()
+            .unwrap()
+            .activate(ActivationContext {
+                mem: vm.guest_memory(),
+                interrupt_cb: Arc::new(FailingInterrupt),
+                queues: (0..2)
+                    .map(|index| {
+                        (
+                            index,
+                            Default::default(),
+                            EventFd::new(EFD_NONBLOCK).unwrap(),
+                        )
+                    })
+                    .collect(),
+                device_status: Arc::new(AtomicU8::default()),
+            })
+            .unwrap();
+        vmm.vm = VmOwnership::Owned(vm);
+
+        assert!(matches!(
+            vmm.vm_resize(None, Some(64 << 20), Some(32 << 20)),
+            Err(VmError::DeviceManager(
+                DeviceManagerError::VirtioBalloonResize(_)
+            ))
+        ));
+        assert_eq!(config.lock().unwrap().memory.size, 128 << 20);
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            96 << 20
+        );
+        config.lock().unwrap().validate().unwrap();
+
+        balloon.lock().unwrap().reset();
+        vmm.vm_resize(None, Some(64 << 20), Some(32 << 20)).unwrap();
+        assert_eq!(config.lock().unwrap().memory.size, 64 << 20);
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            32 << 20
+        );
+        config.lock().unwrap().validate().unwrap();
+
+        // An unsuccessful RAM increase must not inflate the balloon either.
+        assert!(matches!(
+            vmm.vm_resize(None, Some(512 << 20), Some(256 << 20)),
+            Err(VmError::MemoryManager(
+                memory_manager::Error::InsufficientHotplugRam(_, _)
+            ))
+        ));
+        assert_eq!(config.lock().unwrap().memory.size, 64 << 20);
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            32 << 20
+        );
+        config.lock().unwrap().validate().unwrap();
+
+        vmm.vm_resize(None, Some(256 << 20), Some(192 << 20))
+            .unwrap();
+        assert_eq!(config.lock().unwrap().memory.size, 256 << 20);
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            192 << 20
+        );
+        config.lock().unwrap().validate().unwrap();
+    }
+
+    #[test]
     fn test_vmm_vm_cold_resize_with_memory_zones() {
         let mut vmm = create_dummy_vmm();
         let mut config = create_dummy_vm_config();

@@ -1982,7 +1982,7 @@ impl Vm {
         &mut self,
         desired_vcpus: Option<u32>,
         desired_memory: Option<u64>,
-        desired_balloon: Option<u64>,
+        mut desired_balloon: Option<u64>,
     ) -> Result<()> {
         event!("vm", "resizing");
 
@@ -2001,6 +2001,16 @@ impl Vm {
                     .map_err(Error::DeviceManager)?;
             }
             self.config.lock().unwrap().cpus.boot_vcpus = desired_vcpus;
+        }
+
+        // Deflate before reducing RAM so a failed balloon resize cannot leave
+        // the configured balloon larger than the configured RAM.
+        let balloon_size = self.config.lock().unwrap().balloon.as_ref().map(|b| b.size);
+        if let Some(desired_size) = desired_balloon
+            && balloon_size.is_some_and(|size| desired_size < size)
+        {
+            self.resize_balloon(desired_size)?;
+            desired_balloon = None;
         }
 
         if let Some(desired_memory) = desired_memory {
@@ -2053,20 +2063,26 @@ impl Vm {
         }
 
         if let Some(desired_balloon) = desired_balloon {
-            self.device_manager
-                .lock()
-                .unwrap()
-                .resize_balloon(desired_balloon)
-                .map_err(Error::DeviceManager)?;
-
-            // Update the configuration value for the balloon size to ensure
-            // a reboot would use the right value.
-            if let Some(balloon_config) = &mut self.config.lock().unwrap().balloon {
-                balloon_config.size = desired_balloon;
-            }
+            self.resize_balloon(desired_balloon)?;
         }
 
         event!("vm", "resized");
+
+        Ok(())
+    }
+
+    fn resize_balloon(&mut self, desired_balloon: u64) -> Result<()> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .resize_balloon(desired_balloon)
+            .map_err(Error::DeviceManager)?;
+
+        // Update the configuration value for the balloon size to ensure
+        // a reboot would use the right value.
+        if let Some(balloon_config) = &mut self.config.lock().unwrap().balloon {
+            balloon_config.size = desired_balloon;
+        }
 
         Ok(())
     }
