@@ -271,8 +271,21 @@ impl BlockEpollHandler {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Failed to parse virtio-blk request at head {head}: {e}");
+                    let len = match Request::find_status_addr(
+                        &mut desc_chain,
+                        self.access_platform.as_deref(),
+                    ) {
+                        Some(status_addr) => {
+                            desc_chain
+                                .memory()
+                                .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
+                                .map_err(Error::RequestStatus)?;
+                            1
+                        }
+                        None => 0,
+                    };
                     queue
-                        .add_used(desc_chain.memory(), head, 0)
+                        .add_used(desc_chain.memory(), head, len)
                         .map_err(Error::QueueAddUsed)?;
                     queue
                         .enable_notification(desc_chain.memory())

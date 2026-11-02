@@ -27,8 +27,8 @@ use vm_memory::{
     Address as _, Bytes as _, GuestAddress, GuestMemoryBackend as _, GuestMemoryError,
     GuestMemoryLoadGuard,
 };
-use vm_virtio::AccessPlatform;
 use vm_virtio::checked_descriptor::DescriptorChainExt;
+use vm_virtio::{AccessPlatform, Translatable};
 use vmm_sys_util::file_traits::FileSync;
 
 use crate::async_io::{
@@ -174,6 +174,18 @@ impl Request {
         req.status_addr = status_desc.addr();
 
         Ok(req)
+    }
+
+    pub fn find_status_addr<B: Bitmap + 'static>(
+        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<vm_memory::GuestMemoryMmap<B>>>,
+        access_platform: Option<&dyn AccessPlatform>,
+    ) -> Option<GuestAddress> {
+        let status_desc = desc_chain.by_ref().last()?;
+        if status_desc.has_next() || !status_desc.is_write_only() || status_desc.len() == 0 {
+            return None;
+        }
+        let addr = status_desc.addr().translate_gva(access_platform, 1).ok()?;
+        desc_chain.memory().check_range(addr, 1).then_some(addr)
     }
 
     pub fn execute<T: FileExt + FileSync, B: Bitmap + 'static>(
