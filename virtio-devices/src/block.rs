@@ -266,8 +266,9 @@ impl BlockEpollHandler {
                 return Err(Error::QueueDuplicatedHeadIndex);
             }
 
-            let mut request = match Request::parse(&mut desc_chain, self.access_platform.as_deref())
-            {
+            // Keep the full chain available for status recovery after a parse error.
+            let mut chain = desc_chain.clone();
+            let mut request = match Request::parse(&mut chain, self.access_platform.as_deref()) {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Failed to parse virtio-blk request at head {head}: {e}");
@@ -1626,6 +1627,30 @@ mod tests {
         handler.process_queue_submit().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
+    }
+
+    #[test]
+    fn parse_failure_after_status_reports_ioerr() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        mem.write_slice(&[0, 0xff, 0xff, 0xff], GuestAddress(REQ_STATUS_ADDR))
+            .unwrap();
+        vq.dtable[0].set(REQ_HDR_ADDR, 16, VRING_DESC_F_NEXT as u16, 1);
+        // A non-flush request without data fails after consuming the status.
+        vq.dtable[1].set(REQ_STATUS_ADDR, 1, VRING_DESC_F_WRITE as u16, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let mut handler = make_handler(vq.create_queue(), &mem, 0);
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(vq.used.idx.get(), 1);
+        let mut status = [0u8; 4];
+        mem.read_slice(&mut status, GuestAddress(REQ_STATUS_ADDR))
+            .unwrap();
+        assert_eq!(status, [VIRTIO_BLK_S_IOERR as u8, 0xff, 0xff, 0xff]);
     }
 
     // The status descriptor may be a single byte, so a rejected request must

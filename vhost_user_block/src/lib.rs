@@ -130,7 +130,9 @@ impl VhostUserBlkThread {
             .pop_descriptor_chain(self.mem.memory())
         {
             debug!("got an element in the queue");
-            let len = match Request::parse(&mut desc_chain, None) {
+            // Keep the full chain available for status recovery after a parse error.
+            let mut chain = desc_chain.clone();
+            let len = match Request::parse(&mut chain, None) {
                 Ok(mut request) => {
                     debug!("element is a valid request");
                     request.writeback = self.writeback.load(Ordering::Acquire);
@@ -621,5 +623,67 @@ pub fn start_block_backend(backend_command: &str) {
         if let Err(e) = thread.lock().unwrap().kill_evt.write(1) {
             error!("Error shutting down worker thread: {e:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+    use virtio_queue::desc::split::Descriptor;
+    use vm_memory::GuestAddress;
+
+    use super::*;
+
+    fn process_rejected_request(request_type: u32, descs: &[(u64, u32, u16)]) -> (u8, u32) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        mem.write_obj(request_type, GuestAddress(0x2000)).unwrap();
+        mem.write_slice(&[0, 0xff, 0xff, 0xff], GuestAddress(0x4000))
+            .unwrap();
+        for (i, &(addr, len, flags)) in descs.iter().enumerate() {
+            let flags = if i + 1 < descs.len() {
+                flags | VRING_DESC_F_NEXT as u16
+            } else {
+                flags
+            };
+            mem.write_obj(
+                Descriptor::new(addr, len, flags, (i + 1) as u16),
+                GuestAddress(0x1000 + i as u64 * 16),
+            )
+            .unwrap();
+        }
+        mem.write_obj(0u16, GuestAddress(0x1104)).unwrap();
+        mem.write_obj(1u16, GuestAddress(0x1102)).unwrap();
+
+        let mem_atomic = GuestMemoryAtomic::new(mem.clone());
+        let vring = VringRwLock::new(mem_atomic.clone(), 8).unwrap();
+        vring.set_queue_info(0x1000, 0x1100, 0x1200).unwrap();
+        vring.set_queue_ready(true);
+        let mut thread = VhostUserBlkThread::new(
+            Arc::new(Mutex::new(AlignedFile::new(
+                File::open("/dev/null").unwrap(),
+                false,
+            ))),
+            Vec::new(),
+            0,
+            Arc::new(AtomicBool::new(false)),
+            mem_atomic,
+        )
+        .unwrap();
+        assert!(thread.process_queue(&mut vring.get_mut()));
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x1202)).unwrap(), 1);
+        let mut status = [0u8; 4];
+        mem.read_slice(&mut status, GuestAddress(0x4000)).unwrap();
+        assert_eq!(&status[1..], &[0xff; 3]);
+        (status[0], mem.read_obj(GuestAddress(0x1208)).unwrap())
+    }
+
+    #[test]
+    fn parse_failure_after_status_reports_ioerr() {
+        let (status, len) = process_rejected_request(
+            VIRTIO_BLK_T_IN,
+            &[(0x2000, 16, 0), (0x4000, 1, VRING_DESC_F_WRITE as u16)],
+        );
+        assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
+        assert_eq!(len, 1);
     }
 }
