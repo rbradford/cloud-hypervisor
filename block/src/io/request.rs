@@ -176,16 +176,30 @@ impl Request {
         Ok(req)
     }
 
-    pub fn find_status_addr<B: Bitmap + 'static>(
+    /// Find the status address and written prefix length for a failed request.
+    /// The chain must not have been consumed by parsing.
+    pub fn find_status<B: Bitmap + 'static>(
         desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<vm_memory::GuestMemoryMmap<B>>>,
         access_platform: Option<&dyn AccessPlatform>,
-    ) -> Option<GuestAddress> {
-        let status_desc = desc_chain.by_ref().last()?;
+    ) -> Option<(GuestAddress, u32)> {
+        let mut status_desc = desc_chain.next()?;
+        let mut used_len = 1;
+        for desc in desc_chain.by_ref() {
+            // used.len covers a prefix starting at the first writable buffer.
+            // Writing only the status leaves that prefix empty if data precedes it.
+            if status_desc.is_write_only() && status_desc.len() != 0 {
+                used_len = 0;
+            }
+            status_desc = desc;
+        }
         if status_desc.has_next() || !status_desc.is_write_only() || status_desc.len() == 0 {
             return None;
         }
         let addr = status_desc.addr().translate_gva(access_platform, 1).ok()?;
-        desc_chain.memory().check_range(addr, 1).then_some(addr)
+        desc_chain
+            .memory()
+            .check_range(addr, 1)
+            .then_some((addr, used_len))
     }
 
     pub fn execute<T: FileExt + FileSync, B: Bitmap + 'static>(

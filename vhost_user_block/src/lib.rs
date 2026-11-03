@@ -161,8 +161,8 @@ impl VhostUserBlkThread {
                 }
                 Err(err) => {
                     error!("failed to parse available descriptor chain: {err:?}");
-                    match Request::find_status_addr(&mut desc_chain, None) {
-                        Some(status_addr) => {
+                    match Request::find_status(&mut desc_chain, None) {
+                        Some((status_addr, len)) => {
                             if let Err(e) = desc_chain
                                 .memory()
                                 .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
@@ -173,7 +173,7 @@ impl VhostUserBlkThread {
                                 );
                                 0
                             } else {
-                                1
+                                len
                             }
                         }
                         None => 0,
@@ -637,6 +637,7 @@ mod tests {
     fn process_rejected_request(request_type: u32, descs: &[(u64, u32, u16)]) -> (u8, u32) {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         mem.write_obj(request_type, GuestAddress(0x2000)).unwrap();
+        mem.write_obj(0xaau8, GuestAddress(0xf000)).unwrap();
         mem.write_slice(&[0, 0xff, 0xff, 0xff], GuestAddress(0x4000))
             .unwrap();
         for (i, &(addr, len, flags)) in descs.iter().enumerate() {
@@ -674,6 +675,7 @@ mod tests {
         let mut status = [0u8; 4];
         mem.read_slice(&mut status, GuestAddress(0x4000)).unwrap();
         assert_eq!(&status[1..], &[0xff; 3]);
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(0xf000)).unwrap(), 0xaa);
         (status[0], mem.read_obj(GuestAddress(0x1208)).unwrap())
     }
 
@@ -685,5 +687,24 @@ mod tests {
         );
         assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
         assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn parse_failure_reports_written_prefix() {
+        for (request_type, data_flags, expected_len) in [
+            (VIRTIO_BLK_T_IN, VRING_DESC_F_WRITE as u16, 0),
+            (VIRTIO_BLK_T_OUT, 0, 1),
+        ] {
+            let (status, len) = process_rejected_request(
+                request_type,
+                &[
+                    (0x2000, 16, 0),
+                    (0xf000, 0x2000, data_flags),
+                    (0x4000, 1, VRING_DESC_F_WRITE as u16),
+                ],
+            );
+            assert_eq!(status, VIRTIO_BLK_S_IOERR as u8);
+            assert_eq!(len, expected_len);
+        }
     }
 }

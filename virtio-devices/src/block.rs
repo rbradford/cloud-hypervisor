@@ -272,16 +272,16 @@ impl BlockEpollHandler {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("Failed to parse virtio-blk request at head {head}: {e}");
-                    let len = match Request::find_status_addr(
+                    let len = match Request::find_status(
                         &mut desc_chain,
                         self.access_platform.as_deref(),
                     ) {
-                        Some(status_addr) => {
+                        Some((status_addr, len)) => {
                             desc_chain
                                 .memory()
                                 .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
                                 .map_err(Error::RequestStatus)?;
-                            1
+                            len
                         }
                         None => 0,
                     };
@@ -1651,6 +1651,44 @@ mod tests {
         mem.read_slice(&mut status, GuestAddress(REQ_STATUS_ADDR))
             .unwrap();
         assert_eq!(status, [VIRTIO_BLK_S_IOERR as u8, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn parse_failure_reports_written_prefix() {
+        for (request_type, data_flags, expected_len) in [
+            (VIRTIO_BLK_T_IN, VRING_DESC_F_WRITE as u16, 0),
+            (VIRTIO_BLK_T_OUT, 0, 1),
+        ] {
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+            mem.write_obj(request_type, GuestAddress(REQ_HDR_ADDR))
+                .unwrap();
+            mem.write_obj(0xaau8, GuestAddress(0xf000)).unwrap();
+            mem.write_obj(VIRTIO_BLK_S_OK as u8, GuestAddress(REQ_STATUS_ADDR))
+                .unwrap();
+            let next = VRING_DESC_F_NEXT as u16;
+            vq.dtable[0].set(REQ_HDR_ADDR, 16, next, 1);
+            // The data buffer extends past guest RAM, but its first byte is backed.
+            vq.dtable[1].set(0xf000, 0x2000, next | data_flags, 2);
+            vq.dtable[2].set(REQ_STATUS_ADDR, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.idx.set(1);
+
+            let mut handler = make_handler(vq.create_queue(), &mem, 0);
+            handler.process_queue_submit().unwrap();
+
+            assert_eq!(vq.used.idx.get(), 1);
+            assert_eq!(
+                mem.read_obj::<u8>(GuestAddress(REQ_STATUS_ADDR)).unwrap(),
+                VIRTIO_BLK_S_IOERR as u8
+            );
+            assert_eq!(mem.read_obj::<u8>(GuestAddress(0xf000)).unwrap(), 0xaa);
+            assert_eq!(
+                mem.read_obj::<u32>(GuestAddress(vq.used.ring[0].location.0 + 4))
+                    .unwrap(),
+                expected_len
+            );
+        }
     }
 
     // The status descriptor may be a single byte, so a rejected request must
