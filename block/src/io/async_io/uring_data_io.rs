@@ -127,10 +127,11 @@ impl UringDataIo {
         let mut signal_completion = false;
         let mut batch = batch.into_iter();
         while let Some(op) = batch.next() {
-            let user_data = op.user_data();
-            let entry = Self::build_entry(&self.file, &op);
+            let request = InFlightRequest::Data(op);
+            let user_data = request.user_data();
+            let entry = Self::build_entry(&self.file, &request);
             self.in_flight
-                .insert(InFlightRequest::Data(op))
+                .insert(request)
                 .expect("batch validated before submission");
 
             // SAFETY: the SQ capacity was just checked. Every iovec's pointer is retained in
@@ -190,30 +191,34 @@ impl UringDataIo {
         warn!("io_uring submission queue became full after capacity check: {error:?}");
     }
 
-    fn build_entry(file: &File, op: &AsyncIoOperation) -> squeue::Entry {
-        let iovecs = op.iovecs();
+    fn build_entry(file: &File, request: &InFlightRequest) -> squeue::Entry {
         let fd = types::Fd(file.as_raw_fd());
-        if op.is_read() {
-            opcode::Readv::new(fd, iovecs.as_ptr(), iovecs.len() as u32)
-                .offset(op.offset() as u64)
-                .build()
-                .user_data(op.user_data())
-        } else {
-            opcode::Writev::new(fd, iovecs.as_ptr(), iovecs.len() as u32)
-                .offset(op.offset() as u64)
-                .build()
-                .user_data(op.user_data())
-        }
+
+        let entry = match request {
+            InFlightRequest::Data(op) => {
+                let iovecs = op.iovecs();
+                if op.is_read() {
+                    opcode::Readv::new(fd, iovecs.as_ptr(), iovecs.len() as u32)
+                        .offset(op.offset() as u64)
+                        .build()
+                } else {
+                    opcode::Writev::new(fd, iovecs.as_ptr(), iovecs.len() as u32)
+                        .offset(op.offset() as u64)
+                        .build()
+                }
+            }
+            InFlightRequest::Fsync { .. } => opcode::Fsync::new(fd).build(),
+        };
+
+        entry.user_data(request.user_data())
     }
 
     /// Submits an fsync operation carrying `user_data`.
     pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
-        self.submit_kernel_entry(
-            InFlightRequest::Fsync { user_data },
-            &opcode::Fsync::new(types::Fd(self.file.as_raw_fd()))
-                .build()
-                .user_data(user_data),
-        )
+        let request = InFlightRequest::Fsync { user_data };
+        let entry = Self::build_entry(&self.file, &request);
+
+        self.submit_kernel_entry(request, &entry)
     }
 
     /// Injects a completion that did not come from a kernel CQE.
@@ -403,6 +408,11 @@ mod tests {
         let completion = wait_for_completion(&mut data_io);
         assert_eq!(completion.user_data, 7);
         assert_eq!(completion.result, 512);
+
+        data_io.submit_fsync(7).unwrap();
+        let completion = wait_for_completion(&mut data_io);
+        assert_eq!(completion.user_data, 7);
+        assert_eq!(completion.result, 0);
     }
 
     #[test]
