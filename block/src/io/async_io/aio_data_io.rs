@@ -69,6 +69,10 @@ impl AioDataIo {
             Err(e) => errno_result(&e),
         };
 
+        if result == -libc::EAGAIN {
+            // AIO request slots are reclaimed after their completions are read.
+            self.reap_completions();
+        }
         if let Some(completion) = self.complete_request(user_data, result) {
             self.inject_completion(completion);
         }
@@ -145,16 +149,21 @@ impl AioDataIo {
 
     fn reap_completions(&mut self) {
         let mut events = [aio::IoEvent::default(); 32];
-        let rc = match self.ctx.get_events(0, &mut events, None) {
-            Ok(rc) => rc,
-            Err(e) => {
-                warn!("Linux AIO get_events failed: {e}");
-                return;
+        loop {
+            let rc = match self.ctx.get_events(0, &mut events, None) {
+                Ok(rc) => rc,
+                Err(e) => {
+                    warn!("Linux AIO get_events failed: {e}");
+                    return;
+                }
+            };
+            for event in &events[..rc] {
+                if let Some(completion) = self.complete_request(event.data, event.res as i32) {
+                    self.completions.complete(completion);
+                }
             }
-        };
-        for event in &events[..rc] {
-            if let Some(completion) = self.complete_request(event.data, event.res as i32) {
-                self.completions.complete(completion);
+            if rc < events.len() {
+                return;
             }
         }
     }
@@ -333,5 +342,52 @@ mod tests {
         assert_eq!(Arc::strong_count(&memory), 2);
         drop(data_io);
         assert_eq!(Arc::strong_count(&memory), 1);
+    }
+
+    #[test]
+    fn submission_reaps_a_full_completion_ring_before_retrying() {
+        use std::collections::HashSet;
+
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(1).unwrap();
+        let mut data_io = AioDataIo::new(file, 1).unwrap();
+        let mut rejected = None;
+        // Linux rounds the context capacity up according to the CPU count.
+        // Submit directly without reaping until the kernel rejects an attempt.
+        for user_data in 0..100_000 {
+            let request = InFlightRequest::Data(AsyncIoOperation::read_to_vec(
+                0,
+                OwnedIoBuffer::from_vec(vec![0]),
+                user_data,
+            ));
+            let mut iocb = AioDataIo::build_iocb(&data_io.file, data_io.notifier(), &request);
+            data_io.in_flight.insert(request).unwrap();
+            match data_io.ctx.submit(&[&mut iocb]) {
+                Ok(1) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {
+                    data_io.in_flight.remove(user_data);
+                    rejected = Some(user_data);
+                    break;
+                }
+                result => panic!("unexpected AIO submission result: {result:?}"),
+            }
+        }
+        let user_data = rejected.expect("completion ring did not fill");
+        data_io
+            .submit_operation(AsyncIoOperation::read_to_vec(
+                0,
+                OwnedIoBuffer::from_vec(vec![0]),
+                user_data,
+            ))
+            .unwrap();
+
+        let mut completed = HashSet::new();
+        for _ in 0..=user_data {
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.result, 1);
+            assert!(completed.insert(completion.user_data));
+        }
+        assert!(completed.contains(&user_data));
+        assert!(data_io.next_completion().is_none());
     }
 }
