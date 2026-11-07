@@ -50,7 +50,15 @@ impl AioDataIo {
     /// Submission failures are converted into injected completions so callers
     /// can observe every accepted request through the normal completion path.
     pub fn submit_operation(&mut self, op: AsyncIoOperation) -> io::Result<()> {
-        let request = InFlightRequest::Data(op);
+        self.submit_request(InFlightRequest::Data(op))
+    }
+
+    /// Submits an fsync operation carrying `user_data`.
+    pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
+        self.submit_request(InFlightRequest::Fsync { user_data })
+    }
+
+    fn submit_request(&mut self, request: InFlightRequest) -> io::Result<()> {
         let user_data = request.user_data();
         let mut iocb = Self::build_iocb(&self.file, self.completions.notifier(), &request);
         self.in_flight.insert(request)?;
@@ -66,23 +74,6 @@ impl AioDataIo {
             .remove(user_data)
             .and_then(InFlightRequest::into_completion_buffer);
         self.inject_completion(AsyncIoCompletion::new(user_data, result, buffer));
-        Ok(())
-    }
-
-    /// Submits an fsync operation carrying `user_data`.
-    pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
-        let request = InFlightRequest::Fsync { user_data };
-        let mut iocb = Self::build_iocb(&self.file, self.completions.notifier(), &request);
-        self.in_flight.insert(request)?;
-
-        let result = match self.ctx.submit(&[&mut iocb]) {
-            Ok(1) => return Ok(()),
-            Ok(_) => -libc::EAGAIN,
-            Err(e) => errno_result(&e),
-        };
-
-        self.in_flight.remove(user_data);
-        self.inject_completion(AsyncIoCompletion::new(user_data, result, None));
         Ok(())
     }
 
@@ -136,12 +127,17 @@ impl AioDataIo {
             return Some(completion);
         }
 
+        self.reap_completions();
+        self.completions.next_completed()
+    }
+
+    fn reap_completions(&mut self) {
         let mut events = [aio::IoEvent::default(); 32];
         let rc = match self.ctx.get_events(0, &mut events, None) {
             Ok(rc) => rc,
             Err(e) => {
                 warn!("Linux AIO get_events failed: {e}");
-                return None;
+                return;
             }
         };
         for event in &events[..rc] {
@@ -153,8 +149,6 @@ impl AioDataIo {
                     .and_then(InFlightRequest::into_completion_buffer),
             ));
         }
-
-        self.completions.next_completed()
     }
 }
 
