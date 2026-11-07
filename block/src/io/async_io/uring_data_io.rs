@@ -83,9 +83,11 @@ impl UringDataIo {
             &mut self.needs_submit_retry,
             self.completions.notifier(),
             entry,
-        ) && let Some(completion) = self.complete_request(user_data, errno_result(&error))
-        {
-            self.inject_completion(completion);
+        ) {
+            self.reap_completions();
+            if let Some(completion) = self.complete_request(user_data, errno_result(&error)) {
+                self.inject_completion(completion);
+            }
         }
         Ok(())
     }
@@ -140,9 +142,9 @@ impl UringDataIo {
 
     /// Submits a batch of owned read and write operations.
     ///
-    /// If the submission queue cannot accept the whole batch, retry its
-    /// operations individually. Retry exhaustion is reported through the normal
-    /// completion path.
+    /// If the submission queue cannot accept the whole batch, reap completions
+    /// and retry its operations individually. Retry exhaustion is reported
+    /// through the normal completion path.
     pub fn submit_batch(&mut self, batch: Vec<AsyncIoOperation>) -> io::Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -156,6 +158,7 @@ impl UringDataIo {
             // Not enough space for the batch.
             // Drop sq, which will re-publish an unmodified tail pointer
             drop(sq);
+            self.reap_completions();
             for op in batch {
                 let user_data = op.user_data();
                 self.in_flight
@@ -252,6 +255,22 @@ impl UringDataIo {
         }
 
         self.completions.next_completed()
+    }
+
+    fn reap_completions(&mut self) {
+        if self.needs_submit_retry {
+            match self.io_uring.submitter().submit() {
+                Ok(_) => self.needs_submit_retry = false,
+                Err(error) => warn!("io_uring retry submit failed for retained SQEs: {error}"),
+            }
+        }
+        loop {
+            let entry = self.io_uring.completion().next();
+            let Some(entry) = entry else { break };
+            if let Some(completion) = self.complete_request(entry.user_data(), entry.result()) {
+                self.completions.complete(completion);
+            }
+        }
     }
 }
 
