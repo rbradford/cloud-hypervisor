@@ -14,7 +14,7 @@ use io_uring::{IoUring, opcode, squeue, types};
 use log::{error, warn};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::common::{duplicate_user_data_error, validate_batch};
+use super::common::{InFlightRequest, duplicate_user_data_error, validate_batch};
 use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon};
 
 // Linux UAPI constant for enabling a ring created with IORING_SETUP_R_DISABLED
@@ -27,10 +27,7 @@ pub struct UringDataIo {
     io_uring: IoUring,
     // Keep the file open through draining and closing the ring.
     file: File,
-    // `in_flight` tracks every user_data value accepted by the kernel. Owned
-    // data operations store `Some(op)` so their iovecs and backing buffers
-    // remain valid until completion; metadata operations store `None`.
-    in_flight: HashMap<u64, Option<AsyncIoOperation>>,
+    in_flight: HashMap<u64, InFlightRequest>,
     completions: CompletionCommon,
     // `needs_submit_retry` is set when SQEs have been published to the ring,
     // but the submit syscall failed before confirming kernel ownership.
@@ -74,17 +71,16 @@ impl UringDataIo {
         self.submit_batch(vec![op])
     }
 
-    fn reserve_user_data(&mut self, user_data: u64) -> io::Result<()> {
+    fn submit_kernel_entry(
+        &mut self,
+        request: InFlightRequest,
+        entry: &squeue::Entry,
+    ) -> io::Result<()> {
+        let user_data = request.user_data();
         if self.in_flight.contains_key(&user_data) {
             return Err(duplicate_user_data_error(user_data));
         }
-        self.in_flight.insert(user_data, None);
-
-        Ok(())
-    }
-
-    fn submit_kernel_entry(&mut self, user_data: u64, entry: &squeue::Entry) -> io::Result<()> {
-        self.reserve_user_data(user_data)?;
+        self.in_flight.insert(user_data, request);
 
         let (submitter, mut sq, _) = self.io_uring.split();
         // SAFETY: the entry has no caller-owned buffer. `user_data` is retained
@@ -137,7 +133,8 @@ impl UringDataIo {
         while let Some(op) = batch.next() {
             let user_data = op.user_data();
             let entry = Self::build_entry(&self.file, &op);
-            self.in_flight.insert(user_data, Some(op));
+            let request = InFlightRequest::Data(op);
+            self.in_flight.insert(request.user_data(), request);
 
             // SAFETY: the SQ capacity was just checked. Every iovec's pointer is retained in
             // self.in_flight before the SQ tail is advanced by sync or drop. in_flight only
@@ -173,7 +170,7 @@ impl UringDataIo {
 
     #[cold]
     fn handle_push_failure(
-        in_flight: &mut HashMap<u64, Option<AsyncIoOperation>>,
+        in_flight: &mut HashMap<u64, InFlightRequest>,
         completions: &mut CompletionCommon,
         user_data: u64,
         remaining: impl Iterator<Item = AsyncIoOperation>,
@@ -182,11 +179,14 @@ impl UringDataIo {
         // Since capacity was just checked, this should only happen if the ring
         // state changed unexpectedly. Keep all affected operations memory safe
         // by returning local completions through the normal path.
-        let op = in_flight
+        let request = in_flight
             .remove(&user_data)
-            .flatten()
             .expect("pending operation missing after failed push");
-        completions.complete(AsyncIoCompletion::from_operation(op, -libc::EAGAIN));
+        completions.complete(AsyncIoCompletion::new(
+            request.user_data(),
+            -libc::EAGAIN,
+            request.into_completion_buffer(),
+        ));
         for op in remaining {
             completions.complete(AsyncIoCompletion::from_operation(op, -libc::EAGAIN));
         }
@@ -212,7 +212,7 @@ impl UringDataIo {
     /// Submits an fsync operation carrying `user_data`.
     pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
         self.submit_kernel_entry(
-            user_data,
+            InFlightRequest::Fsync { user_data },
             &opcode::Fsync::new(types::Fd(self.file.as_raw_fd()))
                 .build()
                 .user_data(user_data),
@@ -246,8 +246,7 @@ impl UringDataIo {
                 entry.result(),
                 self.in_flight
                     .remove(&user_data)
-                    .flatten()
-                    .and_then(AsyncIoOperation::into_completion_buffer),
+                    .and_then(InFlightRequest::into_completion_buffer),
             ));
         }
 

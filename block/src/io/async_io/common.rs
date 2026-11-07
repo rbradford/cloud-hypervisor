@@ -7,7 +7,29 @@
 use std::collections::HashSet;
 use std::io;
 
-use super::AsyncIoOperation;
+use super::{AsyncIoOperation, OwnedIoBuffer};
+
+/// Retains the operation and identifier for an outstanding request.
+pub(super) enum InFlightRequest {
+    Data(AsyncIoOperation),
+    Fsync { user_data: u64 },
+}
+
+impl InFlightRequest {
+    pub(super) fn user_data(&self) -> u64 {
+        match self {
+            Self::Data(op) => op.user_data(),
+            Self::Fsync { user_data } => *user_data,
+        }
+    }
+
+    pub(super) fn into_completion_buffer(self) -> Option<OwnedIoBuffer> {
+        match self {
+            Self::Data(op) => op.into_completion_buffer(),
+            Self::Fsync { .. } => None,
+        }
+    }
+}
 
 /// Converts an I/O error into the negative errno form used in completions.
 pub(super) fn errno_result(error: &io::Error) -> i32 {

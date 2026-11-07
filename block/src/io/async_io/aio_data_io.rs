@@ -15,7 +15,7 @@ use log::warn;
 use vmm_sys_util::aio;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::common::{duplicate_user_data_error, errno_result, validate_batch};
+use super::common::{InFlightRequest, duplicate_user_data_error, errno_result, validate_batch};
 use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon};
 
 /// Retained Linux AIO queue for owned async data I/O operations.
@@ -26,10 +26,7 @@ pub struct AioDataIo {
     ctx: aio::IoContext,
     // Keep the file open until the kernel AIO context has been destroyed.
     file: File,
-    // `in_flight` tracks every user_data value accepted by the kernel. Owned
-    // data operations store `Some(op)` so their iovecs and backing buffers
-    // remain valid until completion; metadata operations store `None`.
-    in_flight: HashMap<u64, Option<AsyncIoOperation>>,
+    in_flight: HashMap<u64, InFlightRequest>,
     completions: CompletionCommon,
 }
 
@@ -77,7 +74,8 @@ impl AioDataIo {
             aio_resfd: self.completions.notifier().as_raw_fd() as u32,
             ..Default::default()
         };
-        self.in_flight.insert(user_data, Some(op));
+        let request = InFlightRequest::Data(op);
+        self.in_flight.insert(request.user_data(), request);
 
         let result = match self.ctx.submit(&[&mut iocb]) {
             Ok(1) => return Ok(()),
@@ -88,8 +86,7 @@ impl AioDataIo {
         let buffer = self
             .in_flight
             .remove(&user_data)
-            .flatten()
-            .and_then(AsyncIoOperation::into_completion_buffer);
+            .and_then(InFlightRequest::into_completion_buffer);
         self.inject_completion(AsyncIoCompletion::new(user_data, result, buffer));
         Ok(())
     }
@@ -108,7 +105,8 @@ impl AioDataIo {
             aio_resfd: self.completions.notifier().as_raw_fd() as u32,
             ..Default::default()
         };
-        self.in_flight.insert(user_data, None);
+        self.in_flight
+            .insert(user_data, InFlightRequest::Fsync { user_data });
         let result = match self.ctx.submit(&[&mut iocb]) {
             Ok(1) => return Ok(()),
             Ok(_) => -libc::EAGAIN,
@@ -151,8 +149,7 @@ impl AioDataIo {
                 event.res as i32,
                 self.in_flight
                     .remove(&event.data)
-                    .flatten()
-                    .and_then(AsyncIoOperation::into_completion_buffer),
+                    .and_then(InFlightRequest::into_completion_buffer),
             ));
         }
 
