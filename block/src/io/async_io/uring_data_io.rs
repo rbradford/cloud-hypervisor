@@ -4,7 +4,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::{io, mem};
@@ -14,7 +13,7 @@ use io_uring::{IoUring, opcode, squeue, types};
 use log::{error, warn};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::common::{InFlightRequest, duplicate_user_data_error, validate_batch};
+use super::common::{InFlightRequest, InFlightRequests};
 use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon};
 
 // Linux UAPI constant for enabling a ring created with IORING_SETUP_R_DISABLED
@@ -27,7 +26,7 @@ pub struct UringDataIo {
     io_uring: IoUring,
     // Keep the file open through draining and closing the ring.
     file: File,
-    in_flight: HashMap<u64, InFlightRequest>,
+    in_flight: InFlightRequests,
     completions: CompletionCommon,
     // `needs_submit_retry` is set when SQEs have been published to the ring,
     // but the submit syscall failed before confirming kernel ownership.
@@ -55,7 +54,7 @@ impl UringDataIo {
         Ok(Self {
             io_uring,
             file,
-            in_flight: HashMap::new(),
+            in_flight: InFlightRequests::default(),
             completions,
             needs_submit_retry: false,
         })
@@ -77,16 +76,13 @@ impl UringDataIo {
         entry: &squeue::Entry,
     ) -> io::Result<()> {
         let user_data = request.user_data();
-        if self.in_flight.contains_key(&user_data) {
-            return Err(duplicate_user_data_error(user_data));
-        }
-        self.in_flight.insert(user_data, request);
+        self.in_flight.insert(request)?;
 
         let (submitter, mut sq, _) = self.io_uring.split();
         // SAFETY: the entry has no caller-owned buffer. `user_data` is retained
         // in `in_flight` until the CQE is consumed.
         if let Err(e) = unsafe { sq.push(entry) } {
-            self.in_flight.remove(&user_data);
+            self.in_flight.remove(user_data);
             return Err(io::Error::other(format!("Submission queue is full: {e:?}")));
         }
         sq.sync();
@@ -113,7 +109,7 @@ impl UringDataIo {
             return Ok(());
         }
 
-        validate_batch(|user_data| self.in_flight.contains_key(&user_data), &batch)?;
+        self.in_flight.validate_batch(&batch)?;
 
         let (submitter, mut sq, _) = self.io_uring.split();
         let available = sq.capacity() - sq.len();
@@ -133,8 +129,9 @@ impl UringDataIo {
         while let Some(op) = batch.next() {
             let user_data = op.user_data();
             let entry = Self::build_entry(&self.file, &op);
-            let request = InFlightRequest::Data(op);
-            self.in_flight.insert(request.user_data(), request);
+            self.in_flight
+                .insert(InFlightRequest::Data(op))
+                .expect("batch validated before submission");
 
             // SAFETY: the SQ capacity was just checked. Every iovec's pointer is retained in
             // self.in_flight before the SQ tail is advanced by sync or drop. in_flight only
@@ -170,7 +167,7 @@ impl UringDataIo {
 
     #[cold]
     fn handle_push_failure(
-        in_flight: &mut HashMap<u64, InFlightRequest>,
+        in_flight: &mut InFlightRequests,
         completions: &mut CompletionCommon,
         user_data: u64,
         remaining: impl Iterator<Item = AsyncIoOperation>,
@@ -180,7 +177,7 @@ impl UringDataIo {
         // state changed unexpectedly. Keep all affected operations memory safe
         // by returning local completions through the normal path.
         let request = in_flight
-            .remove(&user_data)
+            .remove(user_data)
             .expect("pending operation missing after failed push");
         completions.complete(AsyncIoCompletion::new(
             request.user_data(),
@@ -245,7 +242,7 @@ impl UringDataIo {
                 user_data,
                 entry.result(),
                 self.in_flight
-                    .remove(&user_data)
+                    .remove(user_data)
                     .and_then(InFlightRequest::into_completion_buffer),
             ));
         }
@@ -281,7 +278,7 @@ impl Drop for UringDataIo {
             drain_iterations += 1;
 
             if let Some(entry) = self.io_uring.completion().next() {
-                self.in_flight.remove(&entry.user_data());
+                self.in_flight.remove(entry.user_data());
                 continue;
             }
 

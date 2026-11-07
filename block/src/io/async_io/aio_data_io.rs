@@ -6,16 +6,15 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-use std::collections::HashMap;
 use std::fs::File;
+use std::io;
 use std::os::fd::AsRawFd;
-use std::{io, slice};
 
 use log::warn;
 use vmm_sys_util::aio;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::common::{InFlightRequest, duplicate_user_data_error, errno_result, validate_batch};
+use super::common::{InFlightRequest, InFlightRequests, errno_result};
 use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon};
 
 /// Retained Linux AIO queue for owned async data I/O operations.
@@ -26,7 +25,7 @@ pub struct AioDataIo {
     ctx: aio::IoContext,
     // Keep the file open until the kernel AIO context has been destroyed.
     file: File,
-    in_flight: HashMap<u64, InFlightRequest>,
+    in_flight: InFlightRequests,
     completions: CompletionCommon,
 }
 
@@ -36,7 +35,7 @@ impl AioDataIo {
         Ok(Self {
             ctx: aio::IoContext::new(queue_depth)?,
             file,
-            in_flight: HashMap::new(),
+            in_flight: InFlightRequests::default(),
             completions: CompletionCommon::new(),
         })
     }
@@ -51,11 +50,6 @@ impl AioDataIo {
     /// Submission failures are converted into injected completions so callers
     /// can observe every accepted request through the normal completion path.
     pub fn submit_operation(&mut self, op: AsyncIoOperation) -> io::Result<()> {
-        validate_batch(
-            |user_data| self.in_flight.contains_key(&user_data),
-            slice::from_ref(&op),
-        )?;
-
         let user_data = op.user_data();
         let iovecs = op.iovecs();
         let opcode = if op.is_read() {
@@ -74,8 +68,7 @@ impl AioDataIo {
             aio_resfd: self.completions.notifier().as_raw_fd() as u32,
             ..Default::default()
         };
-        let request = InFlightRequest::Data(op);
-        self.in_flight.insert(request.user_data(), request);
+        self.in_flight.insert(InFlightRequest::Data(op))?;
 
         let result = match self.ctx.submit(&[&mut iocb]) {
             Ok(1) => return Ok(()),
@@ -85,7 +78,7 @@ impl AioDataIo {
 
         let buffer = self
             .in_flight
-            .remove(&user_data)
+            .remove(user_data)
             .and_then(InFlightRequest::into_completion_buffer);
         self.inject_completion(AsyncIoCompletion::new(user_data, result, buffer));
         Ok(())
@@ -93,9 +86,8 @@ impl AioDataIo {
 
     /// Submits an fsync operation carrying `user_data`.
     pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
-        if self.in_flight.contains_key(&user_data) {
-            return Err(duplicate_user_data_error(user_data));
-        }
+        self.in_flight
+            .insert(InFlightRequest::Fsync { user_data })?;
 
         let mut iocb = aio::IoControlBlock {
             aio_fildes: self.file.as_raw_fd() as u32,
@@ -105,15 +97,13 @@ impl AioDataIo {
             aio_resfd: self.completions.notifier().as_raw_fd() as u32,
             ..Default::default()
         };
-        self.in_flight
-            .insert(user_data, InFlightRequest::Fsync { user_data });
         let result = match self.ctx.submit(&[&mut iocb]) {
             Ok(1) => return Ok(()),
             Ok(_) => -libc::EAGAIN,
             Err(e) => errno_result(&e),
         };
 
-        self.in_flight.remove(&user_data);
+        self.in_flight.remove(user_data);
         self.inject_completion(AsyncIoCompletion::new(user_data, result, None));
         Ok(())
     }
@@ -148,7 +138,7 @@ impl AioDataIo {
                 event.data,
                 event.res as i32,
                 self.in_flight
-                    .remove(&event.data)
+                    .remove(event.data)
                     .and_then(InFlightRequest::into_completion_buffer),
             ));
         }
