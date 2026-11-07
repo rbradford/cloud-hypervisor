@@ -69,6 +69,7 @@ use libc::{c_void, siginfo_t};
 use linux_loader::elf::Elf64_Nhdr;
 use log::{debug, error, info, warn};
 use seccompiler::{BpfProgram, SeccompAction, apply_filter};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::BusDevice;
@@ -791,6 +792,7 @@ pub struct CpuManager {
     // Shared with AcpiCpuHotplugController
     vcpu_states: Arc<Mutex<Vec<VcpuState>>>,
     vcpus: Vec<Arc<Mutex<Vcpu>>>,
+    restored_state: Option<CpuManagerState>,
     seccomp_action: SeccompAction,
     vm_ops: Arc<dyn VmOps>,
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -835,6 +837,19 @@ impl TryFrom<i32> for CoreSchedulingLeader {
             _ => Err(()),
         }
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct CpuManagerState {
+    vcpus: Vec<VcpuHotplugState>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VcpuHotplugState {
+    active: bool,
+    inserting: bool,
+    removing: bool,
+    pending_removal: bool,
 }
 
 /// Management structure for a vCPU (thread).
@@ -1028,6 +1043,7 @@ impl CpuManager {
             #[cfg(feature = "guest_debug")]
             vm_debug_evt,
             vcpus: Vec::with_capacity(max_vcpus),
+            restored_state: None,
             seccomp_action,
             vm_ops,
             acpi_address: None,
@@ -1628,7 +1644,15 @@ impl CpuManager {
     ) -> Result<Vec<Arc<Mutex<Vcpu>>>> {
         trace_scoped!("create_boot_vcpus");
 
-        let num_vcpus = self.boot_vcpus();
+        self.restored_state = snapshot
+            .filter(|snapshot| snapshot.snapshot_data.is_some())
+            .map(Snapshot::to_state)
+            .transpose()
+            .map_err(|e| Error::VcpuCreate(e.into()))?;
+        let num_vcpus = self
+            .restored_state
+            .as_ref()
+            .map_or(self.boot_vcpus(), |state| state.vcpus.len() as u32);
         #[cfg(all(feature = "kvm", feature = "sev_snp"))]
         let num_vcpus =
             if self.sev_snp_enabled && self.hypervisor.hypervisor_type() == HypervisorType::Kvm {
@@ -1666,6 +1690,42 @@ impl CpuManager {
     }
 
     pub fn start_restored_vcpus(&mut self) -> Result<()> {
+        if let Some(state) = self.restored_state.take() {
+            self.vcpus_pause_signalled.store(true, Ordering::SeqCst);
+            let active_vcpus = state.vcpus.iter().filter(|state| state.active).count();
+            let barrier = Arc::new(Barrier::new(active_vcpus + 1));
+            let seccomp_filter = Arc::new(
+                get_seccomp_filter(
+                    &self.seccomp_action,
+                    Thread::Vcpu,
+                    Some(self.hypervisor.hypervisor_type()),
+                )
+                .map_err(Error::CreateSeccompFilter)?,
+            );
+
+            for (id, saved_state) in state.vcpus.into_iter().enumerate() {
+                {
+                    let mut states = self.vcpu_states.lock().unwrap();
+                    states[id].inserting = saved_state.inserting;
+                    states[id].removing = saved_state.removing;
+                    states[id]
+                        .pending_removal
+                        .store(saved_state.pending_removal, Ordering::SeqCst);
+                }
+                if saved_state.active {
+                    self.start_vcpu(
+                        Arc::clone(&self.vcpus[id]),
+                        id as u32,
+                        Arc::clone(&barrier),
+                        Arc::clone(&seccomp_filter),
+                        saved_state.inserting,
+                    )?;
+                }
+            }
+            barrier.wait();
+            return Ok(());
+        }
+
         self.activate_vcpus(self.vcpus.len() as u32, false, Some(true))
             .map_err(|e| {
                 Error::StartRestoreVcpu(anyhow!("Failed to start restored vCPUs: {e:#?}"))
@@ -2870,8 +2930,22 @@ impl Snapshottable for CpuManager {
             VCPU_SERIALIZE_MIN_CHUNKS_PER_THREAD,
         )?;
 
-        // The CpuManager snapshot is a collection of all vCPUs snapshots.
-        let mut cpu_manager_snapshot = Snapshot::default();
+        let state = CpuManagerState {
+            vcpus: self
+                .vcpu_states
+                .lock()
+                .unwrap()
+                .iter()
+                .take(self.vcpus.len())
+                .map(|state| VcpuHotplugState {
+                    active: state.active(),
+                    inserting: state.inserting,
+                    removing: state.removing,
+                    pending_removal: state.pending_removal.load(Ordering::SeqCst),
+                })
+                .collect(),
+        };
+        let mut cpu_manager_snapshot = Snapshot::new_from_state(&state)?;
         for (id, snapshot) in snapshots {
             cpu_manager_snapshot.add_snapshot(id, snapshot);
         }
@@ -3366,12 +3440,16 @@ impl AcpiCpuHotplugController {
     const CPU_STATUS_OFFSET: u64 = 4;
 
     /// Creates a new [`AcpiCpuHotplugController`].
-    pub fn new(cpu_manager: &CpuManager) -> AcpiCpuHotplugController {
+    pub fn new(cpu_manager: &CpuManager, selected_cpu: u32) -> AcpiCpuHotplugController {
         Self {
             max_vcpus: cpu_manager.config.max_vcpus,
-            selected_cpu: 0,
+            selected_cpu,
             vcpu_states: Arc::clone(&cpu_manager.vcpu_states),
         }
+    }
+
+    pub(crate) fn selected_cpu(&self) -> u32 {
+        self.selected_cpu
     }
 
     /// Removes a vCPU from the guest.

@@ -870,6 +870,8 @@ impl DeviceRelocation for AddressManager {
 struct DeviceManagerState {
     device_tree: DeviceTree,
     device_id_cnt: Wrapping<usize>,
+    #[serde(default)]
+    selected_cpu: u32,
 }
 
 #[derive(Debug)]
@@ -1001,7 +1003,7 @@ pub struct DeviceManager {
 
     /// Owned version needed to keep the bus device alive (the bus only holds
     /// a weak reference).
-    _acpi_cpu_hotplug_controller: Arc<Mutex<AcpiCpuHotplugController>>,
+    acpi_cpu_hotplug_controller: Arc<Mutex<AcpiCpuHotplugController>>,
 
     // The virtio devices on the system
     virtio_devices: Vec<MetaVirtioDevice>,
@@ -1221,8 +1223,11 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         trace_scoped!("DeviceManager::new");
 
-        let (device_tree, device_id_cnt) = if let Some(snapshot) = snapshot.as_ref() {
-            let state: DeviceManagerState = snapshot.to_state().unwrap();
+        let state: Option<DeviceManagerState> = snapshot
+            .map(Snapshot::to_state)
+            .transpose()
+            .map_err(DeviceManagerError::RestoreGetState)?;
+        let (device_tree, device_id_cnt) = if let Some(state) = &state {
             (
                 Arc::new(Mutex::new(state.device_tree.clone())),
                 state.device_id_cnt,
@@ -1336,8 +1341,10 @@ impl DeviceManager {
             )?);
         }
 
-        let acpi_cpu_hotplug_controller =
-            AcpiCpuHotplugController::new(&cpu_manager.lock().unwrap());
+        let acpi_cpu_hotplug_controller = AcpiCpuHotplugController::new(
+            &cpu_manager.lock().unwrap(),
+            state.as_ref().map_or(0, |state| state.selected_cpu),
+        );
         let acpi_cpu_hotplug_controller = Arc::new(Mutex::new(acpi_cpu_hotplug_controller));
 
         if dynamic {
@@ -1462,7 +1469,7 @@ impl DeviceManager {
             fw_cfg: None,
             #[cfg(feature = "ivshmem")]
             ivshmem_device: None,
-            _acpi_cpu_hotplug_controller: acpi_cpu_hotplug_controller,
+            acpi_cpu_hotplug_controller,
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -1649,6 +1656,11 @@ impl DeviceManager {
         DeviceManagerState {
             device_tree: self.device_tree.lock().unwrap().clone(),
             device_id_cnt: self.device_id_cnt,
+            selected_cpu: self
+                .acpi_cpu_hotplug_controller
+                .lock()
+                .unwrap()
+                .selected_cpu(),
         }
     }
 
