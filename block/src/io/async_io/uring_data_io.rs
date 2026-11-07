@@ -5,7 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, RawFd};
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::{io, mem};
 
 use io_uring::register::Restriction;
@@ -24,6 +25,8 @@ const IORING_REGISTER_ENABLE_RINGS: u8 = 12;
 /// Holds the `IoUring` and tracks the ops that are pending.
 pub struct UringDataIo {
     io_uring: IoUring,
+    // Keep the file open through draining and closing the ring.
+    file: File,
     // `in_flight` tracks every user_data value accepted by the kernel. Owned
     // data operations store `Some(op)` so their iovecs and backing buffers
     // remain valid until completion; metadata operations store `None`.
@@ -35,8 +38,8 @@ pub struct UringDataIo {
 }
 
 impl UringDataIo {
-    /// Creates an io_uring queue and registers its completion eventfd.
-    pub fn new(ring_depth: u32) -> io::Result<Self> {
+    /// Creates an io_uring queue for `file` and registers its completion eventfd.
+    pub fn new(file: File, ring_depth: u32) -> io::Result<Self> {
         let io_uring = IoUring::builder().setup_r_disabled().build(ring_depth)?;
         let completions = CompletionCommon::new();
         io_uring
@@ -55,6 +58,7 @@ impl UringDataIo {
 
         Ok(Self {
             io_uring,
+            file,
             in_flight: HashMap::new(),
             completions,
             needs_submit_retry: false,
@@ -67,8 +71,8 @@ impl UringDataIo {
     }
 
     /// Submits one owned read or write operation to the queue.
-    pub fn submit_operation(&mut self, fd: RawFd, op: AsyncIoOperation) -> io::Result<()> {
-        self.submit_batch(fd, vec![op])
+    pub fn submit_operation(&mut self, op: AsyncIoOperation) -> io::Result<()> {
+        self.submit_batch(vec![op])
     }
 
     fn reserve_user_data(&mut self, user_data: u64) -> io::Result<()> {
@@ -109,7 +113,7 @@ impl UringDataIo {
     /// If the io_uring submission queue cannot accept the whole batch, each
     /// operation is completed locally with `-EAGAIN` so callers can observe
     /// every request through the normal completion path.
-    pub fn submit_batch(&mut self, fd: RawFd, batch: Vec<AsyncIoOperation>) -> io::Result<()> {
+    pub fn submit_batch(&mut self, batch: Vec<AsyncIoOperation>) -> io::Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -133,7 +137,7 @@ impl UringDataIo {
         let mut batch = batch.into_iter();
         while let Some(op) = batch.next() {
             let user_data = op.user_data();
-            let entry = Self::build_entry(fd, &op);
+            let entry = Self::build_entry(&self.file, &op);
             self.in_flight.insert(user_data, Some(op));
 
             // SAFETY: the SQ capacity was just checked. Every iovec's pointer is retained in
@@ -190,9 +194,9 @@ impl UringDataIo {
         warn!("io_uring submission queue became full after capacity check: {error:?}");
     }
 
-    fn build_entry(fd: RawFd, op: &AsyncIoOperation) -> squeue::Entry {
+    fn build_entry(file: &File, op: &AsyncIoOperation) -> squeue::Entry {
         let iovecs = op.iovecs();
-        let fd = types::Fd(fd);
+        let fd = types::Fd(file.as_raw_fd());
         if op.is_read() {
             opcode::Readv::new(fd, iovecs.as_ptr(), iovecs.len() as u32)
                 .offset(op.offset() as u64)
@@ -212,10 +216,10 @@ impl UringDataIo {
     }
 
     /// Submits an fsync operation carrying `user_data`.
-    pub fn submit_fsync(&mut self, fd: RawFd, user_data: u64) -> io::Result<()> {
+    pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
         self.submit_kernel_entry(
             user_data,
-            &opcode::Fsync::new(types::Fd(fd))
+            &opcode::Fsync::new(types::Fd(self.file.as_raw_fd()))
                 .build()
                 .user_data(user_data),
         )
@@ -331,7 +335,8 @@ mod tests {
 
     #[test]
     fn uring_rejects_socket_operations() {
-        let mut data_io = UringDataIo::new(8).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        let mut data_io = UringDataIo::new(file, 8).unwrap();
         let socket = opcode::Socket::new(libc::AF_UNIX, libc::SOCK_STREAM, 0)
             .build()
             .user_data(1);
@@ -352,7 +357,8 @@ mod tests {
 
     #[test]
     fn uring_rejects_sqe_flags() {
-        let mut data_io = UringDataIo::new(8).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        let mut data_io = UringDataIo::new(file, 8).unwrap();
         let nop = opcode::Nop::new()
             .build()
             .flags(squeue::Flags::ASYNC)
@@ -366,7 +372,8 @@ mod tests {
 
     #[test]
     fn uring_rejects_registration_changes() {
-        let data_io = UringDataIo::new(8).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        let data_io = UringDataIo::new(file, 8).unwrap();
         assert_eq!(
             data_io
                 .io_uring
@@ -382,18 +389,18 @@ mod tests {
     fn uring_rejects_duplicate_user_data_for_metadata_ops() {
         let file = TempFile::new().unwrap().into_file();
         file.set_len(512).unwrap();
-        let fd = file.as_raw_fd();
-        let mut data_io = UringDataIo::new(8).unwrap();
+        let mut data_io = UringDataIo::new(file, 8).unwrap();
 
         data_io
-            .submit_operation(
-                fd,
-                AsyncIoOperation::read_to_vec(0, OwnedIoBuffer::from_vec(vec![0; 512]), 7),
-            )
+            .submit_operation(AsyncIoOperation::read_to_vec(
+                0,
+                OwnedIoBuffer::from_vec(vec![0; 512]),
+                7,
+            ))
             .unwrap();
 
         assert_eq!(
-            data_io.submit_fsync(fd, 7).unwrap_err().kind(),
+            data_io.submit_fsync(7).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(
@@ -410,19 +417,15 @@ mod tests {
     fn uring_drop_drains_in_flight_operations() {
         let file = TempFile::new().unwrap().into_file();
         file.set_len(8192).unwrap();
-        let fd = file.as_raw_fd();
-        let mut data_io = UringDataIo::new(8).unwrap();
+        let mut data_io = UringDataIo::new(file, 8).unwrap();
 
         for user_data in 0..4 {
             data_io
-                .submit_operation(
-                    fd,
-                    AsyncIoOperation::read_to_vec(
-                        0,
-                        OwnedIoBuffer::from_vec(vec![0; 512]),
-                        user_data,
-                    ),
-                )
+                .submit_operation(AsyncIoOperation::read_to_vec(
+                    0,
+                    OwnedIoBuffer::from_vec(vec![0; 512]),
+                    user_data,
+                ))
                 .unwrap();
         }
 
@@ -432,8 +435,7 @@ mod tests {
     #[test]
     fn uring_queue_full_batch_completes_each_operation() {
         let file = TempFile::new().unwrap().into_file();
-        let fd = file.as_raw_fd();
-        let mut data_io = UringDataIo::new(1).unwrap();
+        let mut data_io = UringDataIo::new(file, 1).unwrap();
         let available = {
             let (_, sq, _) = data_io.io_uring.split();
             sq.capacity() - sq.len()
@@ -445,7 +447,7 @@ mod tests {
             })
             .collect();
 
-        data_io.submit_batch(fd, batch).unwrap();
+        data_io.submit_batch(batch).unwrap();
 
         let mut completed = Vec::new();
         while let Some(completion) = data_io.next_completion() {

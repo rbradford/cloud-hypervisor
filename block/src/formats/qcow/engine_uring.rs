@@ -9,7 +9,6 @@
 //! QCOW2 async disk backend.
 
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use vmm_sys_util::eventfd::EventFd;
@@ -33,7 +32,6 @@ use crate::async_io::{
 /// before the host offset is known.
 pub(super) struct QcowAsync {
     metadata: Arc<QcowMetadata>,
-    // Drop before data_file so pending SQEs can be submitted while fd is valid.
     data_io: UringDataIo,
     data_file: QcowRawFile,
     backing_file: Option<Arc<dyn BackingRead>>,
@@ -54,7 +52,7 @@ impl QcowAsync {
             cluster_size: metadata.cluster_size(),
             decoder: metadata.decoder(),
             metadata,
-            data_io: UringDataIo::new(ring_depth)?,
+            data_io: UringDataIo::new(data_file.file().file().try_clone()?, ring_depth)?,
             data_file,
             backing_file,
             sparse,
@@ -142,7 +140,7 @@ impl AsyncIo for QcowAsync {
             match self.prepare_read_operation(op) {
                 Ok(Some(op)) => {
                     self.data_io
-                        .submit_operation(self.data_file.as_raw_fd(), op)
+                        .submit_operation(op)
                         .map_err(AsyncIoError::ReadVectored)?;
                 }
                 Ok(None) => {}
@@ -228,7 +226,7 @@ impl AsyncIo for QcowAsync {
 
         if !async_reads.is_empty() {
             self.data_io
-                .submit_batch(self.data_file.as_raw_fd(), async_reads)
+                .submit_batch(async_reads)
                 .map_err(AsyncIoError::SubmitBatchRequests)?;
         }
 

@@ -5,7 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 
 use vmm_sys_util::eventfd::EventFd;
 
@@ -17,7 +16,6 @@ use crate::sparse::{punch_hole, write_zeroes};
 use crate::{SECTOR_SIZE, is_block_device, probe_direct_alignment};
 
 pub(crate) struct RawAsync {
-    // Drop before raw_file so pending SQEs can be submitted while its fd is valid.
     data_io: UringDataIo,
     raw_file: File,
     alignment: Option<u64>,
@@ -26,8 +24,8 @@ pub(crate) struct RawAsync {
 
 impl RawAsync {
     pub(crate) fn new(raw_file: File, direct: bool, ring_depth: u32) -> BlockResult<Self> {
-        let data_io =
-            UringDataIo::new(ring_depth).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+        let data_io = UringDataIo::new(raw_file.try_clone()?, ring_depth)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
         let is_block_device = is_block_device(&raw_file);
         let alignment = if direct {
             Some(probe_direct_alignment(&raw_file).unwrap_or(SECTOR_SIZE))
@@ -56,8 +54,7 @@ impl AsyncIo for RawAsync {
     fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
         let is_read = op.is_read();
 
-        let fd = self.raw_file.as_raw_fd();
-        self.data_io.submit_operation(fd, op).map_err(|e| {
+        self.data_io.submit_operation(op).map_err(|e| {
             if is_read {
                 AsyncIoError::ReadVectored(e)
             } else {
@@ -67,10 +64,9 @@ impl AsyncIo for RawAsync {
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
-        let fd = self.raw_file.as_raw_fd();
         if let Some(user_data) = user_data {
             self.data_io
-                .submit_fsync(fd, user_data)
+                .submit_fsync(user_data)
                 .map_err(AsyncIoError::Fsync)?;
         } else {
             self.raw_file.sync_all().map_err(AsyncIoError::Fsync)?;
@@ -89,7 +85,7 @@ impl AsyncIo for RawAsync {
 
     fn submit_batch_requests(&mut self, batch_request: Vec<AsyncIoOperation>) -> AsyncIoResult<()> {
         self.data_io
-            .submit_batch(self.raw_file.as_raw_fd(), batch_request)
+            .submit_batch(batch_request)
             .map_err(AsyncIoError::SubmitBatchRequests)
     }
 
