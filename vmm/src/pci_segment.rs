@@ -17,11 +17,20 @@ use log::info;
 use pci::{DeviceRelocation, PciBdf, PciBus, PciConfigMmio, PciRoot};
 #[cfg(target_arch = "x86_64")]
 use pci::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE, PciConfigIo};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vm_allocator::AddressAllocator;
 use vm_device::BusDeviceSync;
 
 use crate::device_manager::{AddressManager, DeviceManagerError, DeviceManagerResult};
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PciSegmentState {
+    pci_devices_up: u32,
+    pci_devices_down: u32,
+    #[cfg(target_arch = "x86_64")]
+    config_address: Option<u32>,
+}
 
 pub(crate) struct PciSegment {
     pub(crate) id: u16,
@@ -52,6 +61,27 @@ pub(crate) struct PciSegment {
 }
 
 impl PciSegment {
+    pub(crate) fn state(&self) -> PciSegmentState {
+        PciSegmentState {
+            pci_devices_up: self.pci_devices_up,
+            pci_devices_down: self.pci_devices_down,
+            #[cfg(target_arch = "x86_64")]
+            config_address: self
+                .pci_config_io
+                .as_ref()
+                .map(|config_io| config_io.lock().unwrap().config_address()),
+        }
+    }
+
+    pub(crate) fn restore_state(&mut self, state: &PciSegmentState) {
+        self.pci_devices_up = state.pci_devices_up;
+        self.pci_devices_down = state.pci_devices_down;
+        #[cfg(target_arch = "x86_64")]
+        if let (Some(config_io), Some(address)) = (&self.pci_config_io, state.config_address) {
+            config_io.lock().unwrap().restore_config_address(address);
+        }
+    }
+
     pub(crate) fn new(
         id: u16,
         numa_node: u32,
@@ -610,6 +640,43 @@ mod tests {
             &mock_device_reloc,
         )
         .unwrap()
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn restore_preserves_hotplug_flags_and_config_selection() {
+        use vm_device::BusDevice;
+        use vm_migration::Snapshot;
+
+        let mut segment = setup();
+        segment.pci_devices_up = 1 << 2;
+        segment.pci_devices_down = 1 << 3;
+        let mut config_io = PciConfigIo::new(Arc::clone(&segment.pci_bus));
+        config_io.write(0, 0, &0x8000_0000u32.to_le_bytes());
+        let mut expected = [0; 4];
+        config_io.read(0, 4, &mut expected);
+        assert_ne!(expected, [0xff; 4]);
+        segment.pci_config_io = Some(Arc::new(Mutex::new(config_io)));
+        let state = Snapshot::new_from_state(&segment.state())
+            .unwrap()
+            .to_state()
+            .unwrap();
+
+        let mut restored = setup();
+        restored.pci_config_io = Some(Arc::new(Mutex::new(PciConfigIo::new(Arc::clone(
+            &restored.pci_bus,
+        )))));
+        restored.restore_state(&state);
+        assert_eq!(restored.pci_devices_up, 1 << 2);
+        assert_eq!(restored.pci_devices_down, 1 << 3);
+        let mut actual = [0; 4];
+        restored
+            .pci_config_io
+            .unwrap()
+            .lock()
+            .unwrap()
+            .read(0, 4, &mut actual);
+        assert_eq!(actual, expected);
     }
 
     #[test]

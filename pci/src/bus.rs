@@ -261,6 +261,16 @@ impl PciConfigIo {
         }
     }
 
+    /// Address selected by the guest for subsequent configuration accesses.
+    pub fn config_address(&self) -> u32 {
+        self.config_address
+    }
+
+    /// Restore the guest's configuration address selection.
+    pub fn restore_config_address(&mut self, config_address: u32) {
+        self.config_address = config_address;
+    }
+
     pub fn config_space_read(&self) -> u32 {
         let enabled = (self.config_address & 0x8000_0000) != 0;
         if !enabled {

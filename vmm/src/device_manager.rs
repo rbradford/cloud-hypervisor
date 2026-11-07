@@ -150,7 +150,7 @@ use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::locked_unix_listener::LockedUnixListener;
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
-use crate::pci_segment::PciSegment;
+use crate::pci_segment::{PciSegment, PciSegmentState};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 use crate::sev::SevSnpSharedPageTracker;
@@ -871,6 +871,10 @@ struct DeviceManagerState {
     device_tree: DeviceTree,
     device_id_cnt: Wrapping<usize>,
     #[serde(default)]
+    pci_segments: Vec<PciSegmentState>,
+    #[serde(default)]
+    selected_segment: usize,
+    #[serde(default)]
     selected_cpu: u32,
 }
 
@@ -1341,6 +1345,12 @@ impl DeviceManager {
             )?);
         }
 
+        if let Some(state) = &state {
+            for (segment, saved_segment) in pci_segments.iter_mut().zip(&state.pci_segments) {
+                segment.restore_state(saved_segment);
+            }
+        }
+
         let acpi_cpu_hotplug_controller = AcpiCpuHotplugController::new(
             &cpu_manager.lock().unwrap(),
             state.as_ref().map_or(0, |state| state.selected_cpu),
@@ -1446,7 +1456,7 @@ impl DeviceManager {
                 .try_clone()
                 .map_err(DeviceManagerError::EventFd)?,
             acpi_address,
-            selected_segment: 0,
+            selected_segment: state.as_ref().map_or(0, |state| state.selected_segment),
             serial_manager: None,
             original_termios_opt: Arc::new(Mutex::new(None)),
             virtio_mem_devices: Vec::new(),
@@ -1656,6 +1666,8 @@ impl DeviceManager {
         DeviceManagerState {
             device_tree: self.device_tree.lock().unwrap().clone(),
             device_id_cnt: self.device_id_cnt,
+            pci_segments: self.pci_segments.iter().map(PciSegment::state).collect(),
+            selected_segment: self.selected_segment,
             selected_cpu: self
                 .acpi_cpu_hotplug_controller
                 .lock()
