@@ -50,25 +50,10 @@ impl AioDataIo {
     /// Submission failures are converted into injected completions so callers
     /// can observe every accepted request through the normal completion path.
     pub fn submit_operation(&mut self, op: AsyncIoOperation) -> io::Result<()> {
-        let user_data = op.user_data();
-        let iovecs = op.iovecs();
-        let opcode = if op.is_read() {
-            aio::IOCB_CMD_PREADV
-        } else {
-            aio::IOCB_CMD_PWRITEV
-        };
-        let mut iocb = aio::IoControlBlock {
-            aio_fildes: self.file.as_raw_fd() as u32,
-            aio_lio_opcode: opcode as u16,
-            aio_buf: iovecs.as_ptr() as u64,
-            aio_nbytes: iovecs.len() as u64,
-            aio_offset: op.offset(),
-            aio_data: user_data,
-            aio_flags: aio::IOCB_FLAG_RESFD,
-            aio_resfd: self.completions.notifier().as_raw_fd() as u32,
-            ..Default::default()
-        };
-        self.in_flight.insert(InFlightRequest::Data(op))?;
+        let request = InFlightRequest::Data(op);
+        let user_data = request.user_data();
+        let mut iocb = Self::build_iocb(&self.file, self.completions.notifier(), &request);
+        self.in_flight.insert(request)?;
 
         let result = match self.ctx.submit(&[&mut iocb]) {
             Ok(1) => return Ok(()),
@@ -86,17 +71,10 @@ impl AioDataIo {
 
     /// Submits an fsync operation carrying `user_data`.
     pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
-        self.in_flight
-            .insert(InFlightRequest::Fsync { user_data })?;
+        let request = InFlightRequest::Fsync { user_data };
+        let mut iocb = Self::build_iocb(&self.file, self.completions.notifier(), &request);
+        self.in_flight.insert(request)?;
 
-        let mut iocb = aio::IoControlBlock {
-            aio_fildes: self.file.as_raw_fd() as u32,
-            aio_lio_opcode: aio::IOCB_CMD_FSYNC as u16,
-            aio_data: user_data,
-            aio_flags: aio::IOCB_FLAG_RESFD,
-            aio_resfd: self.completions.notifier().as_raw_fd() as u32,
-            ..Default::default()
-        };
         let result = match self.ctx.submit(&[&mut iocb]) {
             Ok(1) => return Ok(()),
             Ok(_) => -libc::EAGAIN,
@@ -106,6 +84,39 @@ impl AioDataIo {
         self.in_flight.remove(user_data);
         self.inject_completion(AsyncIoCompletion::new(user_data, result, None));
         Ok(())
+    }
+
+    fn build_iocb(
+        file: &File,
+        notifier: &EventFd,
+        request: &InFlightRequest,
+    ) -> aio::IoControlBlock {
+        let mut iocb = aio::IoControlBlock {
+            aio_fildes: file.as_raw_fd() as u32,
+            aio_data: request.user_data(),
+            aio_flags: aio::IOCB_FLAG_RESFD,
+            aio_resfd: notifier.as_raw_fd() as u32,
+            ..Default::default()
+        };
+
+        match request {
+            InFlightRequest::Data(op) => {
+                let iovecs = op.iovecs();
+                iocb.aio_lio_opcode = if op.is_read() {
+                    aio::IOCB_CMD_PREADV as u16
+                } else {
+                    aio::IOCB_CMD_PWRITEV as u16
+                };
+                iocb.aio_buf = iovecs.as_ptr() as u64;
+                iocb.aio_nbytes = iovecs.len() as u64;
+                iocb.aio_offset = op.offset();
+            }
+            InFlightRequest::Fsync { .. } => {
+                iocb.aio_lio_opcode = aio::IOCB_CMD_FSYNC as u16;
+            }
+        }
+
+        iocb
     }
 
     /// Injects a completion that did not come from a kernel AIO event.
@@ -195,6 +206,11 @@ mod tests {
             completion.buffer.unwrap().as_slice(),
             [0xa5; 512].as_slice()
         );
+
+        data_io.submit_fsync(7).unwrap();
+        let completion = wait_for_completion(&mut data_io);
+        assert_eq!(completion.user_data, 7);
+        assert_eq!(completion.result, 0);
     }
 
     #[test]
