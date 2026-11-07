@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, RawFd};
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::{io, slice};
 
 use log::warn;
@@ -23,6 +24,8 @@ pub struct AioDataIo {
     // dropping the context destroys kernel AIO state before retained
     // operations release the buffers referenced by their iovecs.
     ctx: aio::IoContext,
+    // Keep the file open until the kernel AIO context has been destroyed.
+    file: File,
     // `in_flight` tracks every user_data value accepted by the kernel. Owned
     // data operations store `Some(op)` so their iovecs and backing buffers
     // remain valid until completion; metadata operations store `None`.
@@ -31,10 +34,11 @@ pub struct AioDataIo {
 }
 
 impl AioDataIo {
-    /// Creates a Linux AIO context and its completion eventfd.
-    pub fn new(queue_depth: u32) -> io::Result<Self> {
+    /// Creates a Linux AIO context for `file` and its completion eventfd.
+    pub fn new(file: File, queue_depth: u32) -> io::Result<Self> {
         Ok(Self {
             ctx: aio::IoContext::new(queue_depth)?,
+            file,
             in_flight: HashMap::new(),
             completions: CompletionCommon::new(),
         })
@@ -49,7 +53,7 @@ impl AioDataIo {
     ///
     /// Submission failures are converted into injected completions so callers
     /// can observe every accepted request through the normal completion path.
-    pub fn submit_operation(&mut self, fd: RawFd, op: AsyncIoOperation) -> io::Result<()> {
+    pub fn submit_operation(&mut self, op: AsyncIoOperation) -> io::Result<()> {
         validate_batch(
             |user_data| self.in_flight.contains_key(&user_data),
             slice::from_ref(&op),
@@ -63,7 +67,7 @@ impl AioDataIo {
             aio::IOCB_CMD_PWRITEV
         };
         let mut iocb = aio::IoControlBlock {
-            aio_fildes: fd.as_raw_fd() as u32,
+            aio_fildes: self.file.as_raw_fd() as u32,
             aio_lio_opcode: opcode as u16,
             aio_buf: iovecs.as_ptr() as u64,
             aio_nbytes: iovecs.len() as u64,
@@ -91,13 +95,13 @@ impl AioDataIo {
     }
 
     /// Submits an fsync operation carrying `user_data`.
-    pub fn submit_fsync(&mut self, fd: RawFd, user_data: u64) -> io::Result<()> {
+    pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
         if self.in_flight.contains_key(&user_data) {
             return Err(duplicate_user_data_error(user_data));
         }
 
         let mut iocb = aio::IoControlBlock {
-            aio_fildes: fd.as_raw_fd() as u32,
+            aio_fildes: self.file.as_raw_fd() as u32,
             aio_lio_opcode: aio::IOCB_CMD_FSYNC as u16,
             aio_data: user_data,
             aio_flags: aio::IOCB_FLAG_RESFD,
@@ -159,7 +163,6 @@ impl AioDataIo {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
-    use std::os::fd::AsRawFd;
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -183,18 +186,18 @@ mod tests {
     fn aio_rejects_duplicate_user_data_for_metadata_ops() {
         let mut file = TempFile::new().unwrap().into_file();
         file.write_all(&[0xa5; 512]).unwrap();
-        let fd = file.as_raw_fd();
-        let mut data_io = AioDataIo::new(8).unwrap();
+        let mut data_io = AioDataIo::new(file, 8).unwrap();
 
         data_io
-            .submit_operation(
-                fd,
-                AsyncIoOperation::read_to_vec(0, OwnedIoBuffer::from_vec(vec![0; 512]), 7),
-            )
+            .submit_operation(AsyncIoOperation::read_to_vec(
+                0,
+                OwnedIoBuffer::from_vec(vec![0; 512]),
+                7,
+            ))
             .unwrap();
 
         assert_eq!(
-            data_io.submit_fsync(fd, 7).unwrap_err().kind(),
+            data_io.submit_fsync(7).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
 
@@ -209,7 +212,8 @@ mod tests {
 
     #[test]
     fn aio_injected_completion_uses_completion_path() {
-        let mut data_io = AioDataIo::new(8).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        let mut data_io = AioDataIo::new(file, 8).unwrap();
 
         data_io.inject_completion(AsyncIoCompletion::new(9, -libc::EIO, None));
 

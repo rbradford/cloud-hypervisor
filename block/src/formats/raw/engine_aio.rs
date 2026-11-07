@@ -8,7 +8,6 @@
 //
 
 use std::fs::File;
-use std::os::unix::io::AsRawFd;
 
 use vmm_sys_util::eventfd::EventFd;
 
@@ -28,8 +27,8 @@ pub(super) struct RawAio {
 
 impl RawAio {
     pub(super) fn new(raw_file: File, direct: bool, queue_depth: u32) -> BlockResult<Self> {
-        let data_io =
-            AioDataIo::new(queue_depth).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+        let data_io = AioDataIo::new(raw_file.try_clone()?, queue_depth)
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
         let is_block_device = is_block_device(&raw_file);
         let alignment = if direct {
             Some(probe_direct_alignment(&raw_file).unwrap_or(SECTOR_SIZE))
@@ -58,8 +57,7 @@ impl AsyncIo for RawAio {
     fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
         let is_read = op.is_read();
 
-        let fd = self.raw_file.as_raw_fd();
-        self.data_io.submit_operation(fd, op).map_err(|e| {
+        self.data_io.submit_operation(op).map_err(|e| {
             if is_read {
                 AsyncIoError::ReadVectored(e)
             } else {
@@ -69,10 +67,9 @@ impl AsyncIo for RawAio {
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
-        let fd = self.raw_file.as_raw_fd();
         if let Some(user_data) = user_data {
             self.data_io
-                .submit_fsync(fd, user_data)
+                .submit_fsync(user_data)
                 .map_err(AsyncIoError::Fsync)?;
         } else {
             self.raw_file.sync_all().map_err(AsyncIoError::Fsync)?;
