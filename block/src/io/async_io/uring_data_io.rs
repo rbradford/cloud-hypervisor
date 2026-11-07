@@ -78,24 +78,39 @@ impl UringDataIo {
         let user_data = request.user_data();
         self.in_flight.insert(request)?;
 
-        let (submitter, mut sq, _) = self.io_uring.split();
-        // SAFETY: the entry has no caller-owned buffer. `user_data` is retained
-        // in `in_flight` until the CQE is consumed.
-        if let Err(e) = unsafe { sq.push(entry) } {
+        if let Err(error) = Self::submit_entry(
+            &mut self.io_uring,
+            &mut self.needs_submit_retry,
+            self.completions.notifier(),
+            entry,
+        ) {
             self.in_flight.remove(user_data);
-            return Err(io::Error::other(format!("Submission queue is full: {e:?}")));
+            return Err(error);
         }
-        sq.sync();
+        Ok(())
+    }
 
+    fn submit_entry(
+        io_uring: &mut IoUring,
+        needs_submit_retry: &mut bool,
+        notifier: &EventFd,
+        entry: &squeue::Entry,
+    ) -> io::Result<()> {
+        let (submitter, mut sq, _) = io_uring.split();
+        // SAFETY: the caller retains the request and its buffers in in_flight
+        // before publishing this entry, and keeps them until its CQE is consumed.
+        unsafe { sq.push(entry) }
+            .map_err(|e| io::Error::other(format!("Submission queue is full: {e:?}")))?;
+        sq.sync();
         match submitter.submit() {
-            Ok(_) => self.needs_submit_retry = false,
-            Err(e) => {
-                self.needs_submit_retry = true;
-                warn!("io_uring submit failed after SQE was published: {e}");
-                self.completions.notifier().write(1).unwrap();
+            Ok(_) => *needs_submit_retry = false,
+            Err(error) => {
+                *needs_submit_retry = true;
+                warn!("io_uring submit failed after SQE was published: {error}");
+                notifier.write(1).unwrap();
             }
         }
-
+        // Once published, this entry must not be pushed a second time.
         Ok(())
     }
 
@@ -124,30 +139,17 @@ impl UringDataIo {
             return Ok(());
         }
 
-        let mut signal_completion = false;
-        let mut batch = batch.into_iter();
-        while let Some(op) = batch.next() {
+        for op in batch {
             let request = InFlightRequest::Data(op);
-            let user_data = request.user_data();
             let entry = Self::build_entry(&self.file, &request);
             self.in_flight
                 .insert(request)
                 .expect("batch validated before submission");
 
-            // SAFETY: the SQ capacity was just checked. Every iovec's pointer is retained in
-            // self.in_flight before the SQ tail is advanced by sync or drop. in_flight only
-            // drops the memory after a completion.
-            if let Err(e) = unsafe { sq.push(&entry) } {
-                Self::handle_push_failure(
-                    &mut self.in_flight,
-                    &mut self.completions,
-                    user_data,
-                    batch.by_ref(),
-                    &e,
-                );
-                signal_completion = true;
-                break;
-            }
+            // SAFETY: the request and its iovecs are retained before the SQ tail
+            // is published, and remain valid until the completion is consumed.
+            // The whole batch fits in this exclusively borrowed submission queue.
+            unsafe { sq.push(&entry) }.expect("batch fits in submission queue");
         }
 
         sq.sync();
@@ -156,39 +158,10 @@ impl UringDataIo {
             Err(e) => {
                 self.needs_submit_retry = true;
                 warn!("io_uring submit failed after SQEs were published: {e}");
-                signal_completion = true;
+                self.completions.notifier().write(1).unwrap();
             }
         }
-        if signal_completion {
-            self.completions.notifier().write(1).unwrap();
-        }
-
         Ok(())
-    }
-
-    #[cold]
-    fn handle_push_failure(
-        in_flight: &mut InFlightRequests,
-        completions: &mut CompletionCommon,
-        user_data: u64,
-        remaining: impl Iterator<Item = AsyncIoOperation>,
-        error: &squeue::PushError,
-    ) {
-        // Since capacity was just checked, this should only happen if the ring
-        // state changed unexpectedly. Keep all affected operations memory safe
-        // by returning local completions through the normal path.
-        let request = in_flight
-            .remove(user_data)
-            .expect("pending operation missing after failed push");
-        completions.complete(AsyncIoCompletion::new(
-            request.user_data(),
-            -libc::EAGAIN,
-            request.into_completion_buffer(),
-        ));
-        for op in remaining {
-            completions.complete(AsyncIoCompletion::from_operation(op, -libc::EAGAIN));
-        }
-        warn!("io_uring submission queue became full after capacity check: {error:?}");
     }
 
     fn build_entry(file: &File, request: &InFlightRequest) -> squeue::Entry {
