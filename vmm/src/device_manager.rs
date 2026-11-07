@@ -1593,7 +1593,7 @@ impl DeviceManager {
         {
             if self.config.lock().unwrap().pvmemcontrol.is_some() {
                 let (pvmemcontrol_bus_device, pvmemcontrol_pci_device) =
-                    self.make_pvmemcontrol_device()?;
+                    self.make_pvmemcontrol_device(snapshot)?;
                 self.pvmemcontrol_devices =
                     Some((pvmemcontrol_bus_device, pvmemcontrol_pci_device));
             }
@@ -3910,6 +3910,7 @@ impl DeviceManager {
     #[cfg(feature = "pvmemcontrol")]
     fn make_pvmemcontrol_device(
         &mut self,
+        snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<(
         Arc<PvmemcontrolBusDevice>,
         Arc<Mutex<PvmemcontrolPciDevice>>,
@@ -3926,10 +3927,11 @@ impl DeviceManager {
                 id.clone(),
                 pci_device_bdf,
                 self.memory_manager.lock().unwrap().guest_memory(),
-            );
+                snapshot_from_id(snapshot, &id),
+            )
+            .map_err(DeviceManagerError::RestoreGetState)?;
 
         let pvmemcontrol_pci_device = Arc::new(Mutex::new(pvmemcontrol_pci_device));
-        let pvmemcontrol_bus_device = Arc::new(pvmemcontrol_bus_device);
 
         let (bars, new_resources) = self.allocate_pci_bars(
             Arc::clone(&pvmemcontrol_pci_device) as Arc<Mutex<dyn PciDevice>>,

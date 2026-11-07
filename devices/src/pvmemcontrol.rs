@@ -15,6 +15,7 @@ use pci::{
     BarReprogrammingParams, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciBdf,
     PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciSubclass,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_allocator::page_size::get_page_size;
 use vm_allocator::{AddressAllocator, GuestMemory, SystemAllocator};
@@ -64,7 +65,7 @@ impl PciSubclass for PvmemcontrolSubclass {
 
 /// commands have 0 as the most significant byte
 #[repr(u32)]
-#[derive(PartialEq, Eq, Copy, Clone)]
+#[derive(PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
 enum PvmemcontrolTransportCommand {
     Reset = 0x060f_e6d2,
     Register = 0x0e35_9539,
@@ -339,6 +340,25 @@ enum PvmemcontrolState {
     Broken,
 }
 
+#[derive(Serialize, Deserialize)]
+enum PvmemcontrolProtocolState {
+    PercpuInit {
+        connections: Vec<(u32, u64)>,
+        next_conn: u32,
+    },
+    Ready {
+        connections: Vec<(u32, u64)>,
+    },
+    Broken,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PvmemcontrolDeviceState {
+    payload: [u8; 8],
+    command: PvmemcontrolTransportCommand,
+    protocol: PvmemcontrolProtocolState,
+}
+
 pub struct PvmemcontrolDevice {
     transport: PvmemcontrolTransport,
     state: PvmemcontrolState,
@@ -489,6 +509,7 @@ pub struct PvmemcontrolBusDevice {
 
 pub struct PvmemcontrolPciDevice {
     id: String,
+    bus_device: Arc<PvmemcontrolBusDevice>,
     bdf: PciBdf,
     configuration: PciConfiguration,
     bar_regions: Vec<PciBarConfiguration>,
@@ -802,8 +823,51 @@ impl PvmemcontrolDevice {
         id: String,
         bdf: PciBdf,
         mem: GuestMemoryAtomic<GuestMemory>,
-    ) -> (PvmemcontrolPciDevice, PvmemcontrolBusDevice) {
-        let dev = RwLock::new(PvmemcontrolDevice::error());
+        snapshot: Option<&Snapshot>,
+    ) -> Result<(PvmemcontrolPciDevice, Arc<PvmemcontrolBusDevice>), MigratableError> {
+        // Older snapshots contain null for the device state.
+        let state: Option<PvmemcontrolDeviceState> = snapshot
+            .map(Snapshot::to_state::<Option<PvmemcontrolDeviceState>>)
+            .transpose()?
+            .flatten();
+        let pci_state = vm_migration::state_from_id(snapshot, pci::PCI_CONFIGURATION_ID)?;
+        let restoring = pci_state.is_some();
+        let device = if let Some(state) = state {
+            let mut transport = PvmemcontrolTransport::ack();
+            transport
+                .payload
+                .as_mut_slice()
+                .copy_from_slice(&state.payload);
+            transport.command = state.command;
+            let connections = |entries: Vec<(u32, u64)>| {
+                entries
+                    .into_iter()
+                    .map(|(command, address)| {
+                        (GuestConnection::new(command), GuestAddress(address))
+                    })
+                    .collect()
+            };
+            let protocol = match state.protocol {
+                PvmemcontrolProtocolState::PercpuInit {
+                    connections: entries,
+                    next_conn,
+                } => PvmemcontrolState::PercpuInit(PercpuInitState {
+                    port_buf_map: connections(entries),
+                    next_conn: GuestConnection::new(next_conn),
+                }),
+                PvmemcontrolProtocolState::Ready {
+                    connections: entries,
+                } => PvmemcontrolState::Ready(connections(entries)),
+                PvmemcontrolProtocolState::Broken => PvmemcontrolState::Broken,
+            };
+            PvmemcontrolDevice::new(transport, protocol)
+        } else {
+            PvmemcontrolDevice::error()
+        };
+        let bus_device = Arc::new(PvmemcontrolBusDevice {
+            mem,
+            dev: RwLock::new(device),
+        });
         let mut configuration = PciConfiguration::new(
             PVMEMCONTROL_VENDOR_ID,
             PVMEMCONTROL_DEVICE_ID,
@@ -815,20 +879,23 @@ impl PvmemcontrolDevice {
             PVMEMCONTROL_SUBSYSTEM_VENDOR_ID,
             PVMEMCONTROL_SUBSYSTEM_ID,
             None,
-            None,
+            pci_state,
         );
         let command: [u8; 2] = [0x03, 0x01]; // memory, io, SERR#
 
-        configuration.write_config_register(1, 0, &command);
-        (
+        if !restoring {
+            configuration.write_config_register(1, 0, &command);
+        }
+        Ok((
             PvmemcontrolPciDevice {
                 id,
+                bus_device: Arc::clone(&bus_device),
                 bdf,
                 configuration,
                 bar_regions: Vec::new(),
             },
-            PvmemcontrolBusDevice { mem, dev },
-        )
+            bus_device,
+        ))
     }
 }
 
@@ -878,12 +945,34 @@ impl PciDevice for PvmemcontrolPciDevice {
         let bar_id = 0;
         let region_size = PVMEMCONTROL_DEVICE_MMIO_SIZE;
         let restoring = resources.is_some();
+        let saved_address = if let Some(resources) = resources {
+            Some(
+                resources
+                    .into_iter()
+                    .find_map(|resource| {
+                        if let Resource::PciBar { index, base, .. } = resource
+                            && index == bar_id
+                        {
+                            Some(GuestAddress(base))
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or(PciDeviceError::MissingResource)?,
+            )
+        } else {
+            None
+        };
         let bar_addr = mmio32_allocator
-            .allocate(None, region_size, Some(PVMEMCONTROL_DEVICE_MMIO_ALIGN))
+            .allocate(
+                saved_address,
+                region_size,
+                Some(PVMEMCONTROL_DEVICE_MMIO_ALIGN),
+            )
             .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
 
         let bar = PciBarConfiguration::default()
-            .set_index(bar_id as usize)
+            .set_index(bar_id)
             .set_address(bar_addr.raw_value())
             .set_size(region_size)
             .set_region_type(region_type)
@@ -938,7 +1027,28 @@ impl Snapshottable for PvmemcontrolPciDevice {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        let mut snapshot = Snapshot::new_from_state(&())?;
+        let device = self.bus_device.dev.read().unwrap();
+        let connections = |map: &HashMap<GuestConnection, GuestAddress>| {
+            map.iter()
+                .map(|(connection, address)| (connection.command, address.0))
+                .collect()
+        };
+        let protocol = match &device.state {
+            PvmemcontrolState::PercpuInit(state) => PvmemcontrolProtocolState::PercpuInit {
+                connections: connections(&state.port_buf_map),
+                next_conn: state.next_conn.command,
+            },
+            PvmemcontrolState::Ready(map) => PvmemcontrolProtocolState::Ready {
+                connections: connections(map),
+            },
+            PvmemcontrolState::Broken => PvmemcontrolProtocolState::Broken,
+        };
+        let state = PvmemcontrolDeviceState {
+            payload: device.transport.payload.as_slice().try_into().unwrap(),
+            command: device.transport.command,
+            protocol,
+        };
+        let mut snapshot = Snapshot::new_from_state(&state)?;
 
         // Snapshot PciConfiguration
         snapshot.add_snapshot(self.configuration.id(), self.configuration.snapshot()?);
@@ -969,6 +1079,86 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+
+    #[test]
+    fn restore_preserves_connections_and_registration_progress() {
+        let command_offset = mem::offset_of!(PvmemcontrolTransport, command) as u64;
+        for ready in [false, true] {
+            let memory = GuestMemoryAtomic::new(
+                GuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
+            );
+            let (mut pci, bus) = PvmemcontrolDevice::make_device(
+                "test".into(),
+                PciBdf::new(0, 0, 1, 0),
+                memory.clone(),
+                None,
+            )
+            .unwrap();
+            bus.write(
+                0,
+                command_offset,
+                &(PvmemcontrolTransportCommand::Reset as u32).to_le_bytes(),
+            );
+            bus.write(0, 0, &0x100u64.to_le_bytes());
+            bus.write(
+                0,
+                command_offset,
+                &(PvmemcontrolTransportCommand::Register as u32).to_le_bytes(),
+            );
+            if ready {
+                bus.write(
+                    0,
+                    command_offset,
+                    &(PvmemcontrolTransportCommand::Ready as u32).to_le_bytes(),
+                );
+            } else {
+                // Pause between the two halves of a registration payload write.
+                bus.write(0, 0, &0x200u32.to_le_bytes());
+            }
+            pci.write_config_register(1, 0, &[0, 0]);
+            let snapshot = pci.snapshot().unwrap();
+            let (mut restored_pci, restored) = PvmemcontrolDevice::make_device(
+                "test".into(),
+                PciBdf::new(0, 0, 1, 0),
+                memory.clone(),
+                Some(&snapshot),
+            )
+            .unwrap();
+            assert_eq!(restored_pci.read_config_register(1) & 0xffff, 0);
+            if !ready {
+                restored.write(0, 4, &0u32.to_le_bytes());
+                restored.write(
+                    0,
+                    command_offset,
+                    &(PvmemcontrolTransportCommand::Register as u32).to_le_bytes(),
+                );
+                let mut connection = [0; 4];
+                restored.read(0, 0, &mut connection);
+                assert_eq!(u32::from_le_bytes(connection), 0x8000_0001);
+                restored.write(
+                    0,
+                    command_offset,
+                    &(PvmemcontrolTransportCommand::Ready as u32).to_le_bytes(),
+                );
+            }
+            let connections = if ready { 1 } else { 2 };
+            for index in 0..connections {
+                let address = GuestAddress(0x100 * (index + 1));
+                memory
+                    .memory()
+                    .write_obj(PvmemcontrolReq::default(), address)
+                    .unwrap();
+                restored.write(
+                    0,
+                    command_offset,
+                    &(0x8000_0000u32 + index as u32).to_le_bytes(),
+                );
+                let response: PvmemcontrolResp = memory.memory().read_obj(address).unwrap();
+                assert_eq!(response.ret_value.to_native(), get_page_size());
+                assert_eq!(response.arg0.to_native(), MAJOR_VERSION);
+            }
+        }
+    }
 
     #[test]
     fn command_and_function_code_from_raw() {
