@@ -48,7 +48,6 @@ impl UringDataIo {
 
         io_uring.submitter().register_restrictions(&mut [
             Restriction::register_op(IORING_REGISTER_ENABLE_RINGS),
-            Restriction::sqe_op(opcode::Nop::CODE),
             Restriction::sqe_op(opcode::Readv::CODE),
             Restriction::sqe_op(opcode::Writev::CODE),
             Restriction::sqe_op(opcode::Fsync::CODE),
@@ -210,11 +209,6 @@ impl UringDataIo {
         }
     }
 
-    /// Submits an io_uring NOP carrying `user_data`.
-    pub fn submit_nop(&mut self, user_data: u64) -> io::Result<()> {
-        self.submit_kernel_entry(user_data, &opcode::Nop::new().build().user_data(user_data))
-    }
-
     /// Submits an fsync operation carrying `user_data`.
     pub fn submit_fsync(&mut self, user_data: u64) -> io::Result<()> {
         self.submit_kernel_entry(
@@ -340,7 +334,9 @@ mod tests {
         let socket = opcode::Socket::new(libc::AF_UNIX, libc::SOCK_STREAM, 0)
             .build()
             .user_data(1);
-        data_io.submit_kernel_entry(1, &socket).unwrap();
+        // SAFETY: The entry contains no pointers to userspace buffers.
+        unsafe { data_io.io_uring.submission().push(&socket) }.unwrap();
+        data_io.io_uring.submitter().submit().unwrap();
         let completion = wait_for_completion(&mut data_io);
         if completion.result >= 0 {
             // SAFETY: IORING_OP_SOCKET returned a new owned descriptor.
@@ -351,7 +347,9 @@ mod tests {
         let connect = opcode::Connect::new(types::Fd(-1), ptr::null(), 0)
             .build()
             .user_data(2);
-        data_io.submit_kernel_entry(2, &connect).unwrap();
+        // SAFETY: The invalid fd and null address refer to no userspace allocation.
+        unsafe { data_io.io_uring.submission().push(&connect) }.unwrap();
+        data_io.io_uring.submitter().submit().unwrap();
         assert_eq!(wait_for_completion(&mut data_io).result, -libc::EACCES);
     }
 
@@ -359,14 +357,16 @@ mod tests {
     fn uring_rejects_sqe_flags() {
         let file = TempFile::new().unwrap().into_file();
         let mut data_io = UringDataIo::new(file, 8).unwrap();
-        let nop = opcode::Nop::new()
+        let fsync = opcode::Fsync::new(types::Fd(data_io.file.as_raw_fd()))
             .build()
             .flags(squeue::Flags::ASYNC)
             .user_data(1);
-        data_io.submit_kernel_entry(1, &nop).unwrap();
+        // SAFETY: The entry contains no pointers to userspace buffers.
+        unsafe { data_io.io_uring.submission().push(&fsync) }.unwrap();
+        data_io.io_uring.submitter().submit().unwrap();
         assert_eq!(wait_for_completion(&mut data_io).result, -libc::EACCES);
 
-        data_io.submit_nop(2).unwrap();
+        data_io.submit_fsync(2).unwrap();
         assert_eq!(wait_for_completion(&mut data_io).result, 0);
     }
 
@@ -401,10 +401,6 @@ mod tests {
 
         assert_eq!(
             data_io.submit_fsync(7).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(
-            data_io.submit_nop(7).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
 
