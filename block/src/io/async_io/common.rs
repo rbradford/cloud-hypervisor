@@ -10,7 +10,9 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::io;
 
-use super::{AsyncIoOperation, OwnedIoBuffer};
+use super::{AsyncIoCompletion, AsyncIoOperation, OwnedIoBuffer};
+
+const MAX_RETRIES: u8 = 3;
 
 /// Retains the operation and identifier for an outstanding request.
 pub(super) enum InFlightRequest {
@@ -42,7 +44,7 @@ pub(super) fn errno_result(error: &io::Error) -> i32 {
 /// Tracks request identifiers and retains requests until completion.
 #[derive(Default)]
 pub(super) struct InFlightRequests {
-    requests: HashMap<u64, InFlightRequest>,
+    requests: HashMap<u64, (InFlightRequest, u8)>,
 }
 
 impl InFlightRequests {
@@ -68,7 +70,7 @@ impl InFlightRequests {
         let user_data = request.user_data();
         match self.requests.entry(user_data) {
             Entry::Vacant(entry) => {
-                entry.insert(request);
+                entry.insert((request, 0));
                 Ok(())
             }
             Entry::Occupied(_) => Err(io::Error::new(
@@ -79,7 +81,35 @@ impl InFlightRequests {
     }
 
     pub(super) fn remove(&mut self, user_data: u64) -> Option<InFlightRequest> {
-        self.requests.remove(&user_data)
+        self.requests.remove(&user_data).map(|(request, _)| request)
+    }
+
+    /// Completes a finished attempt, retrying transient errors up to three times.
+    ///
+    /// The caller must have consumed the kernel completion or established that
+    /// submission was rejected. `retry` must return an error only if it did not
+    /// publish or submit the request. A successful retry keeps the request and
+    /// its buffers retained until the next completion.
+    pub(super) fn complete(
+        &mut self,
+        user_data: u64,
+        mut result: i32,
+        mut retry: impl FnMut(&InFlightRequest) -> io::Result<()>,
+    ) -> Option<AsyncIoCompletion> {
+        if let Some((request, retries)) = self.requests.get_mut(&user_data) {
+            while (result == -libc::EAGAIN || result == -libc::EINTR) && *retries < MAX_RETRIES {
+                *retries += 1;
+                match retry(request) {
+                    Ok(()) => return None,
+                    Err(error) => result = errno_result(&error),
+                }
+            }
+        }
+
+        let buffer = self
+            .remove(user_data)
+            .and_then(InFlightRequest::into_completion_buffer);
+        Some(AsyncIoCompletion::new(user_data, result, buffer))
     }
 
     #[cfg(feature = "io_uring")]
@@ -140,6 +170,112 @@ mod tests {
             requests.remove(7),
             Some(InFlightRequest::Fsync { user_data: 7 })
         ));
+    }
+
+    #[test]
+    fn retries_keep_the_original_buffer_and_identifier() {
+        for error in [libc::EAGAIN, libc::EINTR] {
+            let mut requests = InFlightRequests::default();
+            let op = AsyncIoOperation::read_to_vec(512, OwnedIoBuffer::from_vec(vec![0xa5; 8]), 7);
+            let iovecs = op.iovecs().as_ptr();
+            let buffer = op.iovecs()[0].iov_base;
+            requests.insert(InFlightRequest::Data(op)).unwrap();
+
+            assert!(
+                requests
+                    .complete(7, -error, |request| {
+                        let InFlightRequest::Data(op) = request else {
+                            panic!("expected data request")
+                        };
+                        assert_eq!(op.user_data(), 7);
+                        assert_eq!(op.offset(), 512);
+                        assert_eq!(op.iovecs().as_ptr(), iovecs);
+                        assert_eq!(op.iovecs()[0].iov_base, buffer);
+                        Ok(())
+                    })
+                    .is_none()
+            );
+            assert_eq!(
+                requests
+                    .insert(InFlightRequest::Fsync { user_data: 7 })
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AlreadyExists
+            );
+
+            let completion = requests
+                .complete(7, 8, |_| panic!("successful I/O retried"))
+                .unwrap();
+            assert_eq!(completion.result, 8);
+            assert_eq!(completion.buffer.unwrap().as_slice(), &[0xa5; 8]);
+            assert!(requests.remove(7).is_none());
+        }
+    }
+
+    #[test]
+    fn retry_limit_spans_kernel_completions() {
+        let mut requests = InFlightRequests::default();
+        requests
+            .insert(InFlightRequest::Fsync { user_data: 7 })
+            .unwrap();
+        let mut attempts = 0;
+        for error in [libc::EAGAIN, libc::EINTR, libc::EAGAIN] {
+            assert!(
+                requests
+                    .complete(7, -error, |request| {
+                        assert!(matches!(request, InFlightRequest::Fsync { user_data: 7 }));
+                        attempts += 1;
+                        Ok(())
+                    })
+                    .is_none()
+            );
+        }
+        let completion = requests
+            .complete(7, -libc::EINTR, |_| panic!("retry limit exceeded"))
+            .unwrap();
+        assert_eq!(attempts, 3);
+        assert_eq!(completion.result, -libc::EINTR);
+        assert!(requests.remove(7).is_none());
+    }
+
+    #[test]
+    fn rejected_resubmissions_are_bounded() {
+        for error in [libc::EAGAIN, libc::EINTR, libc::EIO] {
+            let mut requests = InFlightRequests::default();
+            requests
+                .insert(InFlightRequest::Fsync { user_data: 7 })
+                .unwrap();
+            let mut attempts = 0;
+            let completion = requests
+                .complete(7, -libc::EAGAIN, |_| {
+                    attempts += 1;
+                    Err(io::Error::from_raw_os_error(error))
+                })
+                .unwrap();
+            assert_eq!(attempts, if error == libc::EIO { 1 } else { 3 });
+            assert_eq!(completion.result, -error);
+            assert!(requests.remove(7).is_none());
+        }
+    }
+
+    #[test]
+    fn permanent_errors_and_short_io_are_not_retried() {
+        for result in [-libc::EIO, 0, 4] {
+            let mut requests = InFlightRequests::default();
+            requests
+                .insert(InFlightRequest::Data(AsyncIoOperation::read_to_vec(
+                    0,
+                    OwnedIoBuffer::from_vec(vec![0; 8]),
+                    7,
+                )))
+                .unwrap();
+            let completion = requests
+                .complete(7, result, |_| panic!("unexpected retry"))
+                .unwrap();
+            assert_eq!(completion.result, result);
+            assert!(completion.buffer.is_some());
+            assert!(requests.remove(7).is_none());
+        }
     }
 
     #[test]

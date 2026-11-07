@@ -69,12 +69,24 @@ impl AioDataIo {
             Err(e) => errno_result(&e),
         };
 
-        let buffer = self
-            .in_flight
-            .remove(user_data)
-            .and_then(InFlightRequest::into_completion_buffer);
-        self.inject_completion(AsyncIoCompletion::new(user_data, result, buffer));
+        if let Some(completion) = self.complete_request(user_data, result) {
+            self.inject_completion(completion);
+        }
         Ok(())
+    }
+
+    fn complete_request(&mut self, user_data: u64, result: i32) -> Option<AsyncIoCompletion> {
+        let ctx = &self.ctx;
+        let file = &self.file;
+        let notifier = self.completions.notifier();
+        self.in_flight.complete(user_data, result, |request| {
+            let mut iocb = Self::build_iocb(file, notifier, request);
+            match ctx.submit(&[&mut iocb]) {
+                Ok(1) => Ok(()),
+                Ok(_) => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                Err(error) => Err(error),
+            }
+        })
     }
 
     fn build_iocb(
@@ -141,13 +153,9 @@ impl AioDataIo {
             }
         };
         for event in &events[..rc] {
-            self.completions.complete(AsyncIoCompletion::new(
-                event.data,
-                event.res as i32,
-                self.in_flight
-                    .remove(event.data)
-                    .and_then(InFlightRequest::into_completion_buffer),
-            ));
+            if let Some(completion) = self.complete_request(event.data, event.res as i32) {
+                self.completions.complete(completion);
+            }
         }
     }
 }
@@ -160,7 +168,7 @@ mod tests {
 
     use vmm_sys_util::tempfile::TempFile;
 
-    use super::AioDataIo;
+    use super::{AioDataIo, InFlightRequest};
     use crate::async_io::{AsyncIoCompletion, AsyncIoOperation, OwnedIoBuffer};
 
     fn wait_for_completion(data_io: &mut AioDataIo) -> AsyncIoCompletion {
@@ -219,5 +227,111 @@ mod tests {
         assert_eq!(completion.result, -libc::EIO);
         assert!(completion.buffer.is_none());
         assert!(data_io.next_completion().is_none());
+    }
+
+    #[test]
+    fn retries_retained_data_and_fsync_requests() {
+        use std::os::unix::fs::FileExt;
+
+        let file = TempFile::new().unwrap().into_file();
+        let mut data_io = AioDataIo::new(file, 8).unwrap();
+        for error in [libc::EAGAIN, libc::EINTR] {
+            data_io.file.write_all_at(&[0xa5; 512], 512).unwrap();
+            data_io
+                .in_flight
+                .insert(InFlightRequest::Data(AsyncIoOperation::read_to_vec(
+                    512,
+                    OwnedIoBuffer::from_vec(vec![0; 512]),
+                    7,
+                )))
+                .unwrap();
+            // Simulate a rejected initial attempt, with no kernel I/O outstanding.
+            assert!(data_io.complete_request(7, -error).is_none());
+            assert_eq!(
+                data_io.submit_fsync(7).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.user_data, 7);
+            assert_eq!(completion.result, 512);
+            assert_eq!(completion.buffer.unwrap().as_slice(), &[0xa5; 512]);
+
+            data_io
+                .in_flight
+                .insert(InFlightRequest::Data(AsyncIoOperation::write_from_vec(
+                    512,
+                    OwnedIoBuffer::from_vec(vec![0x5a; 512]),
+                    8,
+                )))
+                .unwrap();
+            assert!(data_io.complete_request(8, -error).is_none());
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.user_data, 8);
+            assert_eq!(completion.result, 512);
+            let mut buffer = [0; 512];
+            data_io.file.read_exact_at(&mut buffer, 512).unwrap();
+            assert_eq!(buffer, [0x5a; 512]);
+
+            data_io
+                .in_flight
+                .insert(InFlightRequest::Fsync { user_data: 9 })
+                .unwrap();
+            assert!(data_io.complete_request(9, -error).is_none());
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.user_data, 9);
+            assert_eq!(completion.result, 0);
+            assert!(data_io.next_completion().is_none());
+        }
+    }
+
+    #[test]
+    fn repeated_kernel_eagain_completes_with_error() {
+        use std::fs::File;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        // An empty nonblocking socket produces a real -EAGAIN completion.
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut data_io = AioDataIo::new(File::from(OwnedFd::from(reader)), 8).unwrap();
+        data_io
+            .submit_operation(AsyncIoOperation::read_to_vec(
+                0,
+                OwnedIoBuffer::from_vec(vec![0; 8]),
+                7,
+            ))
+            .unwrap();
+        let completion = wait_for_completion(&mut data_io);
+        assert_eq!(completion.user_data, 7);
+        assert_eq!(completion.result, -libc::EAGAIN);
+        assert!(completion.buffer.is_some());
+        assert!(data_io.next_completion().is_none());
+    }
+
+    #[test]
+    fn drop_retains_guest_memory_until_retried_io_finishes() {
+        use std::sync::Arc;
+
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        use crate::async_io::GuestMemoryTarget;
+
+        let memory =
+            Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)]).unwrap());
+        let target =
+            GuestMemoryTarget::new(Arc::clone(&memory), &[(GuestAddress(0), 512)]).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(512).unwrap();
+        let mut data_io = AioDataIo::new(file, 8).unwrap();
+        data_io
+            .in_flight
+            .insert(InFlightRequest::Data(AsyncIoOperation::read_to_memory(
+                0, target, 7,
+            )))
+            .unwrap();
+        assert!(data_io.complete_request(7, -libc::EINTR).is_none());
+        assert_eq!(Arc::strong_count(&memory), 2);
+        drop(data_io);
+        assert_eq!(Arc::strong_count(&memory), 1);
     }
 }
