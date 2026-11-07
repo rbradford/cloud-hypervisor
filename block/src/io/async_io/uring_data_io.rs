@@ -97,6 +97,20 @@ impl UringDataIo {
         entry: &squeue::Entry,
     ) -> io::Result<()> {
         let (submitter, mut sq, _) = io_uring.split();
+        if sq.is_full() {
+            // Existing entries are already published. Submit them to free SQ slots.
+            match submitter.submit() {
+                Ok(_) => *needs_submit_retry = false,
+                Err(error) => {
+                    *needs_submit_retry = true;
+                    warn!("io_uring submit failed for published SQEs: {error}");
+                    notifier.write(1).unwrap();
+                }
+            }
+            // Refresh the cached head before trying to push the new entry.
+            sq.sync();
+        }
+
         // SAFETY: the caller retains the request and its buffers in in_flight
         // before publishing this entry, and keeps them until its CQE is consumed.
         unsafe { sq.push(entry) }.map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))?;
