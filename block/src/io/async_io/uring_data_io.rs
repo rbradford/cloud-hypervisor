@@ -13,7 +13,7 @@ use io_uring::{IoUring, opcode, squeue, types};
 use log::{error, warn};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::common::{InFlightRequest, InFlightRequests};
+use super::common::{InFlightRequest, InFlightRequests, errno_result};
 use super::{AsyncIoCompletion, AsyncIoOperation, CompletionCommon};
 
 // Linux UAPI constant for enabling a ring created with IORING_SETUP_R_DISABLED
@@ -83,9 +83,9 @@ impl UringDataIo {
             &mut self.needs_submit_retry,
             self.completions.notifier(),
             entry,
-        ) {
-            self.in_flight.remove(user_data);
-            return Err(error);
+        ) && let Some(completion) = self.complete_request(user_data, errno_result(&error))
+        {
+            self.inject_completion(completion);
         }
         Ok(())
     }
@@ -99,8 +99,7 @@ impl UringDataIo {
         let (submitter, mut sq, _) = io_uring.split();
         // SAFETY: the caller retains the request and its buffers in in_flight
         // before publishing this entry, and keeps them until its CQE is consumed.
-        unsafe { sq.push(entry) }
-            .map_err(|e| io::Error::other(format!("Submission queue is full: {e:?}")))?;
+        unsafe { sq.push(entry) }.map_err(|_| io::Error::from_raw_os_error(libc::EAGAIN))?;
         sq.sync();
         match submitter.submit() {
             Ok(_) => *needs_submit_retry = false,
@@ -114,11 +113,22 @@ impl UringDataIo {
         Ok(())
     }
 
+    fn complete_request(&mut self, user_data: u64, result: i32) -> Option<AsyncIoCompletion> {
+        let file = &self.file;
+        let io_uring = &mut self.io_uring;
+        let needs_submit_retry = &mut self.needs_submit_retry;
+        let notifier = self.completions.notifier();
+        self.in_flight.complete(user_data, result, |request| {
+            let entry = Self::build_entry(file, request);
+            Self::submit_entry(io_uring, needs_submit_retry, notifier, &entry)
+        })
+    }
+
     /// Submits a batch of owned read and write operations.
     ///
-    /// If the io_uring submission queue cannot accept the whole batch, each
-    /// operation is completed locally with `-EAGAIN` so callers can observe
-    /// every request through the normal completion path.
+    /// If the submission queue cannot accept the whole batch, retry its
+    /// operations individually. Retry exhaustion is reported through the normal
+    /// completion path.
     pub fn submit_batch(&mut self, batch: Vec<AsyncIoOperation>) -> io::Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -133,8 +143,13 @@ impl UringDataIo {
             // Drop sq, which will re-publish an unmodified tail pointer
             drop(sq);
             for op in batch {
-                self.completions
-                    .complete(AsyncIoCompletion::from_operation(op, -libc::EAGAIN));
+                let user_data = op.user_data();
+                self.in_flight
+                    .insert(InFlightRequest::Data(op))
+                    .expect("batch validated before submission");
+                if let Some(completion) = self.complete_request(user_data, -libc::EAGAIN) {
+                    self.inject_completion(completion);
+                }
             }
             return Ok(());
         }
@@ -214,15 +229,12 @@ impl UringDataIo {
             }
         }
 
-        if let Some(entry) = self.io_uring.completion().next() {
-            let user_data = entry.user_data();
-            return Some(AsyncIoCompletion::new(
-                user_data,
-                entry.result(),
-                self.in_flight
-                    .remove(user_data)
-                    .and_then(InFlightRequest::into_completion_buffer),
-            ));
+        loop {
+            let entry = self.io_uring.completion().next();
+            let Some(entry) = entry else { break };
+            if let Some(completion) = self.complete_request(entry.user_data(), entry.result()) {
+                return Some(completion);
+            }
         }
 
         self.completions.next_completed()
@@ -287,7 +299,7 @@ mod tests {
     use io_uring::{opcode, squeue, types};
     use vmm_sys_util::tempfile::TempFile;
 
-    use super::UringDataIo;
+    use super::{InFlightRequest, UringDataIo};
     use crate::async_io::{AsyncIoCompletion, AsyncIoOperation, OwnedIoBuffer};
 
     fn wait_for_completion(data_io: &mut UringDataIo) -> AsyncIoCompletion {
@@ -408,8 +420,9 @@ mod tests {
     }
 
     #[test]
-    fn uring_queue_full_batch_completes_each_operation() {
+    fn uring_queue_full_batch_retries_each_operation() {
         let file = TempFile::new().unwrap().into_file();
+        file.set_len(512).unwrap();
         let mut data_io = UringDataIo::new(file, 1).unwrap();
         let available = {
             let (_, sq, _) = data_io.io_uring.split();
@@ -425,12 +438,135 @@ mod tests {
         data_io.submit_batch(batch).unwrap();
 
         let mut completed = Vec::new();
-        while let Some(completion) = data_io.next_completion() {
-            assert_eq!(completion.result, -libc::EAGAIN);
+        for _ in 0..batch_len {
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.result, 512);
             assert!(completion.buffer.is_some());
             completed.push(completion.user_data);
         }
         completed.sort_unstable();
         assert_eq!(completed, (0..batch_len as u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn retries_retained_data_and_fsync_requests() {
+        use std::os::unix::fs::FileExt;
+
+        let file = TempFile::new().unwrap().into_file();
+        let mut data_io = UringDataIo::new(file, 8).unwrap();
+        for error in [libc::EAGAIN, libc::EINTR] {
+            data_io.file.write_all_at(&[0xa5; 512], 512).unwrap();
+            data_io
+                .in_flight
+                .insert(InFlightRequest::Data(AsyncIoOperation::read_to_vec(
+                    512,
+                    OwnedIoBuffer::from_vec(vec![0; 512]),
+                    7,
+                )))
+                .unwrap();
+            // Simulate a rejected initial attempt, with no kernel I/O outstanding.
+            assert!(data_io.complete_request(7, -error).is_none());
+            assert_eq!(
+                data_io.submit_fsync(7).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.user_data, 7);
+            assert_eq!(completion.result, 512);
+            assert_eq!(completion.buffer.unwrap().as_slice(), &[0xa5; 512]);
+
+            data_io
+                .in_flight
+                .insert(InFlightRequest::Data(AsyncIoOperation::write_from_vec(
+                    512,
+                    OwnedIoBuffer::from_vec(vec![0x5a; 512]),
+                    8,
+                )))
+                .unwrap();
+            assert!(data_io.complete_request(8, -error).is_none());
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.user_data, 8);
+            assert_eq!(completion.result, 512);
+            let mut buffer = [0; 512];
+            data_io.file.read_exact_at(&mut buffer, 512).unwrap();
+            assert_eq!(buffer, [0x5a; 512]);
+
+            data_io
+                .in_flight
+                .insert(InFlightRequest::Fsync { user_data: 9 })
+                .unwrap();
+            assert!(data_io.complete_request(9, -error).is_none());
+            let completion = wait_for_completion(&mut data_io);
+            assert_eq!(completion.user_data, 9);
+            assert_eq!(completion.result, 0);
+            assert!(data_io.next_completion().is_none());
+        }
+    }
+
+    #[test]
+    fn published_retry_is_submitted_without_a_second_entry() {
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(512).unwrap();
+        let mut data_io = UringDataIo::new(file, 8).unwrap();
+        data_io
+            .in_flight
+            .insert(InFlightRequest::Data(AsyncIoOperation::read_to_vec(
+                0,
+                OwnedIoBuffer::from_vec(vec![0; 512]),
+                7,
+            )))
+            .unwrap();
+
+        let ring = &mut data_io.io_uring;
+        let file = &data_io.file;
+        let needs_submit_retry = &mut data_io.needs_submit_retry;
+        assert!(
+            data_io
+                .in_flight
+                .complete(7, -libc::EAGAIN, |request| {
+                    let entry = UringDataIo::build_entry(file, request);
+                    // SAFETY: complete retains this request until the CQE is consumed.
+                    unsafe { ring.submission().push(&entry) }.unwrap();
+                    // Model a submit syscall failure after publishing the SQE.
+                    *needs_submit_retry = true;
+                    Ok(())
+                })
+                .is_none()
+        );
+        assert_eq!(data_io.io_uring.submission().len(), 1);
+
+        let completion = wait_for_completion(&mut data_io);
+        assert_eq!(completion.user_data, 7);
+        assert_eq!(completion.result, 512);
+        assert!(!data_io.needs_submit_retry);
+        assert!(data_io.in_flight.is_empty());
+        assert!(data_io.next_completion().is_none());
+    }
+
+    #[test]
+    fn drop_retains_guest_memory_until_retried_io_finishes() {
+        use std::sync::Arc;
+
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        use crate::async_io::GuestMemoryTarget;
+
+        let memory =
+            Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)]).unwrap());
+        let target =
+            GuestMemoryTarget::new(Arc::clone(&memory), &[(GuestAddress(0), 512)]).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(512).unwrap();
+        let mut data_io = UringDataIo::new(file, 8).unwrap();
+        data_io
+            .in_flight
+            .insert(InFlightRequest::Data(AsyncIoOperation::read_to_memory(
+                0, target, 7,
+            )))
+            .unwrap();
+        assert!(data_io.complete_request(7, -libc::EINTR).is_none());
+        assert_eq!(Arc::strong_count(&memory), 2);
+        drop(data_io);
+        assert_eq!(Arc::strong_count(&memory), 1);
     }
 }
