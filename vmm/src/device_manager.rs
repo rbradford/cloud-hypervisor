@@ -1564,6 +1564,7 @@ impl DeviceManager {
                 self.guest_exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
+                snapshot,
             )?;
         }
 
@@ -2089,6 +2090,7 @@ impl DeviceManager {
         interrupt_manager: &dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>,
         reset_evt: EventFd,
         guest_exit_evt: EventFd,
+        snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<Option<Arc<Mutex<devices::AcpiGedDevice>>>> {
         let vcpus_kill_signalled =
             Arc::clone(self.cpu_manager.lock().unwrap().vcpus_kill_signalled());
@@ -2152,7 +2154,14 @@ impl DeviceManager {
             interrupt_group,
             ged_irq,
             ged_address,
+            state_from_id(snapshot, acpi::ACPI_GED_SNAPSHOT_ID)
+                .map_err(DeviceManagerError::RestoreGetState)?,
         )));
+        let id = acpi::ACPI_GED_SNAPSHOT_ID.to_string();
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, ged_device));
         self.address_manager
             .mmio_bus
             .insert(
@@ -6643,6 +6652,12 @@ impl Pausable for DeviceManager {
                 }
             }
         }
+        self.notify_hotplug(
+            AcpiNotificationFlags::CPU_DEVICES_CHANGED
+                | AcpiNotificationFlags::MEMORY_DEVICES_CHANGED
+                | AcpiNotificationFlags::PCI_DEVICES_CHANGED,
+        )
+        .map_err(|e| MigratableError::Resume(e.into()))?;
         Ok(())
     }
 }
