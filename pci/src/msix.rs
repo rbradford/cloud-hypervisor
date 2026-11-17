@@ -95,6 +95,8 @@ macro_rules! impl_method {
 
 impl InterruptSourceGroup for MaybeMutInterruptSourceGroup {
     impl_method! {
+        fn disable(&self) -> interrupt::Result<()>;
+
         fn trigger(&self, index: InterruptIndex) -> interrupt::Result<()>;
 
         fn notifier(&self, index: InterruptIndex) -> Option<EventFd>;
@@ -646,11 +648,29 @@ impl MsixCap {
 mod tests {
     use super::*;
 
-    struct TestInterruptSourceGroup;
+    type RouteUpdate = (InterruptIndex, MsiIrqSourceConfig, bool, bool);
+
+    #[derive(Clone, Default)]
+    struct TestInterruptSourceGroup {
+        updates: Arc<Mutex<Vec<RouteUpdate>>>,
+        disables: Arc<Mutex<usize>>,
+        disable_error: bool,
+        triggers: Arc<Mutex<Vec<InterruptIndex>>>,
+    }
 
     impl InterruptSourceGroup for TestInterruptSourceGroup {
-        fn trigger(&self, _index: InterruptIndex) -> io::Result<()> {
-            unreachable!()
+        fn disable(&self) -> io::Result<()> {
+            *self.disables.lock().unwrap() += 1;
+            if self.disable_error {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn trigger(&self, index: InterruptIndex) -> io::Result<()> {
+            self.triggers.lock().unwrap().push(index);
+            Ok(())
         }
 
         fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
@@ -659,16 +679,66 @@ mod tests {
 
         fn update(
             &self,
-            _index: InterruptIndex,
-            _config: InterruptSourceConfig,
-            _masked: bool,
-            _set_gsi: bool,
+            index: InterruptIndex,
+            config: InterruptSourceConfig,
+            masked: bool,
+            set_gsi: bool,
         ) -> io::Result<()> {
-            unreachable!()
+            let InterruptSourceConfig::MsiIrq(config) = config else {
+                unreachable!()
+            };
+            self.updates
+                .lock()
+                .unwrap()
+                .push((index, config, masked, set_gsi));
+            Ok(())
         }
 
         fn set_gsi(&self) -> io::Result<()> {
             unreachable!()
+        }
+    }
+
+    #[test]
+    fn msix_control_disables_interrupt_sources() {
+        for mutable in [false, true] {
+            for control in [0xc000, 0] {
+                let group = Arc::new(TestInterruptSourceGroup::default());
+                let source = if mutable {
+                    MaybeMutInterruptSourceGroup::Mutable(Arc::new(Mutex::new((*group).clone())))
+                } else {
+                    MaybeMutInterruptSourceGroup::Immutable(
+                        Arc::clone(&group) as Arc<dyn InterruptSourceGroup>
+                    )
+                };
+                let mut config = MsixConfig::new(2, source, 0, None).unwrap();
+                config.set_msg_ctl(0x8000);
+                assert_eq!(group.updates.lock().unwrap().len(), 2);
+                config.set_msg_ctl(control);
+                assert_eq!(*group.disables.lock().unwrap(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn msix_wrapper_propagates_disable_errors() {
+        for mutable in [false, true] {
+            let group = Arc::new(TestInterruptSourceGroup {
+                disable_error: true,
+                ..Default::default()
+            });
+            let source = if mutable {
+                MaybeMutInterruptSourceGroup::Mutable(Arc::new(Mutex::new((*group).clone())))
+            } else {
+                MaybeMutInterruptSourceGroup::Immutable(
+                    Arc::clone(&group) as Arc<dyn InterruptSourceGroup>
+                )
+            };
+            assert_eq!(
+                source.disable().unwrap_err().raw_os_error(),
+                Some(libc::EIO)
+            );
+            assert_eq!(*group.disables.lock().unwrap(), 1);
         }
     }
 
@@ -688,7 +758,7 @@ mod tests {
     fn test_set_pba_bit() {
         let mut config = MsixConfig::new(
             MAX_MSIX_VECTORS_PER_DEVICE,
-            MaybeMutInterruptSourceGroup::Immutable(Arc::new(TestInterruptSourceGroup)),
+            MaybeMutInterruptSourceGroup::Immutable(Arc::new(TestInterruptSourceGroup::default())),
             0,
             None,
         )
