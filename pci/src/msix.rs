@@ -577,8 +577,7 @@ impl MsixCap {
     ) -> Self {
         assert!(table_size < MAX_MSIX_VECTORS_PER_DEVICE);
 
-        // Set the table size and enable MSI-X.
-        let msg_ctl: u16 = 0x8000u16 + table_size - 1;
+        let msg_ctl = table_size - 1;
 
         MsixCap {
             msg_ctl,
@@ -670,6 +669,18 @@ mod tests {
 
         fn set_gsi(&self) -> io::Result<()> {
             unreachable!()
+        }
+    }
+
+    #[test]
+    fn msix_capability_starts_disabled() {
+        for (count, control) in [(1, 0), (4, 3), (17, 16)] {
+            let cap = MsixCap::new(0, count, 0, 0, 0);
+            let bytes = cap.bytes();
+            assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), control);
+            assert_eq!(cap.table_size(), count);
+            assert!(!cap.enabled());
+            assert!(!cap.masked());
         }
     }
 
