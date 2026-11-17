@@ -390,11 +390,9 @@ impl MsixConfig {
             return;
         }
 
-        // Update interrupt routes
-        // Optimisation: only update routes if the entry is not masked;
-        // this is safe because if the entry is masked (starts masked as per spec)
-        // in the table then it won't be triggered. (See: #4273)
-        if self.enabled && !self.masked && !table_entry.masked() {
+        // Direct irqfd sources need the route masked when the table entry
+        // becomes masked. Entries that remain masked need no route update.
+        if self.enabled && !self.masked && (!table_entry.masked() || !old_entry.masked()) {
             let config = MsiIrqSourceConfig {
                 high_addr: table_entry.msg_addr_hi,
                 low_addr: table_entry.msg_addr_lo,
@@ -739,6 +737,66 @@ mod tests {
                 Some(libc::EIO)
             );
             assert_eq!(*group.disables.lock().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn msix_vector_mask_updates_interrupt_routes() {
+        for wide_write in [false, true] {
+            let group = Arc::new(TestInterruptSourceGroup::default());
+            let mut config = MsixConfig::new(
+                2,
+                MaybeMutInterruptSourceGroup::Immutable(
+                    Arc::clone(&group) as Arc<dyn InterruptSourceGroup>
+                ),
+                0x123,
+                None,
+            )
+            .unwrap();
+            config.write_table(0x10, &0xfee0_0000u32.to_le_bytes());
+            config.write_table(0x14, &1u32.to_le_bytes());
+            config.write_table(0x18, &0x40u32.to_le_bytes());
+            config.write_table(0x1c, &0u32.to_le_bytes());
+            config.set_msg_ctl(0x8000);
+            group.updates.lock().unwrap().clear();
+
+            if wide_write {
+                config.write_table(0x18, &0x0000_0001_0000_0041u64.to_le_bytes());
+            } else {
+                config.write_table(0x1c, &1u32.to_le_bytes());
+            }
+            {
+                let updates = group.updates.lock().unwrap();
+                assert_eq!(updates.len(), 1);
+                let (index, route, masked, set_gsi) = &updates[0];
+                assert_eq!(*index, 1);
+                assert_eq!(route.low_addr, 0xfee0_0000);
+                assert_eq!(route.high_addr, 1);
+                assert_eq!(route.data, if wide_write { 0x41 } else { 0x40 });
+                assert_eq!(route.devid, 0x123);
+                assert!(*masked);
+                assert!(*set_gsi);
+            }
+            group.updates.lock().unwrap().clear();
+            config.write_table(0x1c, &1u32.to_le_bytes());
+            config.write_table(0x18, &0x42u32.to_le_bytes());
+            assert!(group.updates.lock().unwrap().is_empty());
+
+            config.set_pba_bit(1, false);
+            config.write_table(0x1c, &0u32.to_le_bytes());
+            {
+                let updates = group.updates.lock().unwrap();
+                assert_eq!(updates.len(), 1);
+                assert_eq!(updates[0].0, 1);
+                assert_eq!(updates[0].1.data, 0x42);
+                assert!(!updates[0].2);
+                assert!(updates[0].3);
+            }
+            assert_eq!(*group.triggers.lock().unwrap(), [1]);
+            assert_eq!(config.get_pba_bit(1), 0);
+            group.updates.lock().unwrap().clear();
+            config.write_table(0x1c, &0u32.to_le_bytes());
+            assert!(group.updates.lock().unwrap().is_empty());
         }
     }
 
