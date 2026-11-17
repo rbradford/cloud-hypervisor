@@ -181,6 +181,12 @@ impl MsiCap {
             }
             _ => debug!("invalid data length"),
         }
+
+        if matches!((offset, data.len()), (MSI_MSG_CTL_OFFSET, 2) | (0, 4)) {
+            let capable = (self.msg_ctl >> 1) & 0x7;
+            let enabled = ((self.msg_ctl >> 4) & 0x7).min(capable);
+            self.msg_ctl = (self.msg_ctl & !MSI_CTL_MULTI_MSG_ENABLE) | (enabled << 4);
+        }
     }
 }
 
@@ -428,6 +434,57 @@ mod tests {
                 assert_eq!(set_gsi, !restored);
             }
         }
+    }
+
+    fn check_msi_mme_write(width: usize) {
+        let limits = [
+            [0u16, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 1, 1, 1, 1],
+            [0, 1, 2, 2, 2, 2, 2, 2],
+            [0, 1, 2, 3, 3, 3, 3, 3],
+            [0, 1, 2, 3, 4, 4, 4, 4],
+            [0, 1, 2, 3, 4, 5, 5, 5],
+        ];
+        let counts = [1, 2, 4, 8, 16, 32];
+        for (capable, expected) in limits.iter().enumerate() {
+            let group = Arc::new(TestInterruptSourceGroup::default());
+            let read_only = 0xa180 | ((capable as u16) << 1);
+            let mut config = MsiConfig::new(
+                read_only,
+                Arc::clone(&group) as Arc<dyn InterruptSourceGroup>,
+                None,
+            )
+            .unwrap();
+            for (request, &enabled) in expected.iter().enumerate() {
+                group.updates.lock().unwrap().clear();
+                let control = !0x70 | ((request as u16) << 4);
+                if width == 2 {
+                    config.update(2, &control.to_le_bytes());
+                } else {
+                    config.update(0, &((u32::from(control) << 16) | 0xffff).to_le_bytes());
+                }
+                assert_eq!(config.cap.msg_ctl & !0x71, read_only);
+                assert_eq!(
+                    (config.cap.msg_ctl >> 4) & 7,
+                    enabled,
+                    "MMC {capable}, MME {request}, width {width}"
+                );
+                assert_eq!(
+                    group.updates.lock().unwrap().len(),
+                    counts[enabled as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn msi_word_write_limits_mme_to_capability() {
+        check_msi_mme_write(2);
+    }
+
+    #[test]
+    fn msi_dword_write_limits_mme_to_capability() {
+        check_msi_mme_write(4);
     }
 
     #[test]
