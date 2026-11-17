@@ -192,11 +192,12 @@ impl MsiConfig {
     ) -> Result<Self, Error> {
         let cap = if let Some(state) = state {
             if state.cap.enabled() {
-                for idx in 0..state.cap.num_enabled_vectors() {
+                let nvec = state.cap.num_enabled_vectors();
+                for idx in 0..nvec {
                     let config = MsiIrqSourceConfig {
                         high_addr: state.cap.msg_addr_hi,
                         low_addr: state.cap.msg_addr_lo,
-                        data: state.cap.msg_data as u32,
+                        data: (u32::from(state.cap.msg_data) & !((nvec - 1) as u32)) | idx as u32,
                         devid: 0,
                     };
 
@@ -255,11 +256,12 @@ impl MsiConfig {
         self.cap.update(offset, data);
 
         if self.cap.enabled() {
-            for idx in 0..self.num_enabled_vectors() {
+            let nvec = self.num_enabled_vectors();
+            for idx in 0..nvec {
                 let config = MsiIrqSourceConfig {
                     high_addr: self.cap.msg_addr_hi,
                     low_addr: self.cap.msg_addr_lo,
-                    data: self.cap.msg_data as u32,
+                    data: (u32::from(self.cap.msg_data) & !((nvec - 1) as u32)) | idx as u32,
                     devid: 0,
                 };
 
@@ -291,5 +293,140 @@ impl Snapshottable for MsiConfig {
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
         Snapshot::new_from_state(&self.state())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use vmm_sys_util::eventfd::EventFd;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TestInterruptSourceGroup {
+        updates: Mutex<Vec<(InterruptIndex, MsiIrqSourceConfig, bool, bool)>>,
+    }
+
+    impl InterruptSourceGroup for TestInterruptSourceGroup {
+        fn trigger(&self, _index: InterruptIndex) -> io::Result<()> {
+            unreachable!()
+        }
+
+        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
+            unreachable!()
+        }
+
+        fn update(
+            &self,
+            index: InterruptIndex,
+            config: InterruptSourceConfig,
+            masked: bool,
+            set_gsi: bool,
+        ) -> io::Result<()> {
+            let InterruptSourceConfig::MsiIrq(config) = config else {
+                unreachable!()
+            };
+            self.updates
+                .lock()
+                .unwrap()
+                .push((index, config, masked, set_gsi));
+            Ok(())
+        }
+
+        fn set_gsi(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn check_msi_message_data(restored: bool) {
+        let cases: &[(u16, u16, &[u32])] = &[
+            (0, 0xa55f, &[0xa55f]),
+            (1, 0xa55f, &[0xa55e, 0xa55f]),
+            (2, 0x43, &[0x40, 0x41, 0x42, 0x43]),
+            (
+                3,
+                0xa55f,
+                &[
+                    0xa558, 0xa559, 0xa55a, 0xa55b, 0xa55c, 0xa55d, 0xa55e, 0xa55f,
+                ],
+            ),
+            (
+                4,
+                0xa55f,
+                &[
+                    0xa550, 0xa551, 0xa552, 0xa553, 0xa554, 0xa555, 0xa556, 0xa557, 0xa558, 0xa559,
+                    0xa55a, 0xa55b, 0xa55c, 0xa55d, 0xa55e, 0xa55f,
+                ],
+            ),
+            (
+                5,
+                0xa55f,
+                &[
+                    0xa540, 0xa541, 0xa542, 0xa543, 0xa544, 0xa545, 0xa546, 0xa547, 0xa548, 0xa549,
+                    0xa54a, 0xa54b, 0xa54c, 0xa54d, 0xa54e, 0xa54f, 0xa550, 0xa551, 0xa552, 0xa553,
+                    0xa554, 0xa555, 0xa556, 0xa557, 0xa558, 0xa559, 0xa55a, 0xa55b, 0xa55c, 0xa55d,
+                    0xa55e, 0xa55f,
+                ],
+            ),
+        ];
+        for &(exponent, data, expected) in cases {
+            let group = Arc::new(TestInterruptSourceGroup::default());
+            let control = 0x180 | (exponent << 1);
+            if restored {
+                let state = MsiConfigState {
+                    cap: MsiCap {
+                        msg_ctl: control | (exponent << 4) | 1,
+                        msg_addr_lo: 0xfee0_0000,
+                        msg_addr_hi: 0x1234,
+                        msg_data: data,
+                        mask_bits: 0xaaaa_aaaa,
+                        pending_bits: 0,
+                    },
+                };
+                MsiConfig::new(
+                    control,
+                    Arc::clone(&group) as Arc<dyn InterruptSourceGroup>,
+                    Some(state),
+                )
+                .unwrap();
+            } else {
+                let mut config = MsiConfig::new(
+                    control,
+                    Arc::clone(&group) as Arc<dyn InterruptSourceGroup>,
+                    None,
+                )
+                .unwrap();
+                config.update(4, &0xfee0_0000u32.to_le_bytes());
+                config.update(8, &0x1234u32.to_le_bytes());
+                config.update(0xc, &data.to_le_bytes());
+                config.update(0x10, &0xaaaa_aaaau32.to_le_bytes());
+                config.update(2, &((exponent << 4) | 1).to_le_bytes());
+            }
+            let updates = group.updates.lock().unwrap();
+            assert_eq!(updates.len(), expected.len());
+            for (index, (&data, &(vector, ref route, masked, set_gsi))) in
+                expected.iter().zip(updates.iter()).enumerate()
+            {
+                assert_eq!(vector as usize, index);
+                assert_eq!(route.data, data, "exponent {exponent}, vector {index}");
+                assert_eq!(route.low_addr, 0xfee0_0000);
+                assert_eq!(route.high_addr, 0x1234);
+                assert_eq!(route.devid, 0);
+                assert_eq!(masked, index % 2 == 1);
+                assert_eq!(set_gsi, !restored);
+            }
+        }
+    }
+
+    #[test]
+    fn msi_live_routes_encode_vector_in_message_data() {
+        check_msi_message_data(false);
+    }
+
+    #[test]
+    fn msi_restored_routes_encode_vector_in_message_data() {
+        check_msi_message_data(true);
     }
 }
