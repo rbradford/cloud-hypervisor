@@ -1330,34 +1330,6 @@ impl VfioCommon {
         status & PCI_CONFIG_STATUS_CAPABILITIES_LIST != 0
     }
 
-    fn get_msix_cap_idx(&self) -> Option<usize> {
-        if !self.has_capabilities() {
-            return None;
-        }
-
-        let mut cap_next = self
-            .vfio_wrapper
-            .read_config_byte(PCI_CONFIG_CAPABILITY_OFFSET)
-            & PCI_CONFIG_CAPABILITY_PTR_MASK;
-
-        while cap_next != 0 {
-            let cap_id = self.vfio_wrapper.read_config_byte(cap_next.into());
-            if PciCapabilityId::from(cap_id) == PciCapabilityId::MsiX {
-                return Some(cap_next as usize);
-            }
-            let cap_ptr = self.vfio_wrapper.read_config_byte((cap_next + 1).into())
-                & PCI_CONFIG_CAPABILITY_PTR_MASK;
-
-            // See parse_capabilities below for an explanation.
-            if cap_ptr == cap_next {
-                break;
-            }
-            cap_next = cap_ptr;
-        }
-
-        None
-    }
-
     fn parse_capabilities(&mut self, bdf: PciBdf) -> Result<(), VfioPciError> {
         if !self.has_capabilities() {
             return Ok(());
@@ -1976,12 +1948,10 @@ impl VfioCommon {
             return self.configuration.read_reg(reg_idx);
         }
 
-        if let Some(id) = self.get_msix_cap_idx()
-            && let Some(msix) = &self.interrupt.msix
-        {
-            if reg_idx * 4 == id + 4 {
+        if let Some(msix) = &self.interrupt.msix {
+            if reg_idx * 4 == msix.cap_offset as usize + 4 {
                 return msix.cap.table;
-            } else if reg_idx * 4 == id + 8 {
+            } else if reg_idx * 4 == msix.cap_offset as usize + 8 {
                 return msix.cap.pba;
             }
         }
@@ -1997,6 +1967,12 @@ impl VfioCommon {
 
         // The config register read comes from the VFIO device itself.
         let mut value = self.vfio_wrapper.read_config_dword((reg_idx * 4) as u32) & mask;
+
+        if let Some(msix) = &self.interrupt.msix
+            && reg_idx * 4 == msix.cap_offset as usize
+        {
+            value = (value & !0xc000_0000) | ((u32::from(msix.cap.msg_ctl) << 16) & 0xc000_0000);
+        }
 
         if let Some(config_patch) = self.patches.get(&reg_idx) {
             value = (value & !config_patch.mask) | config_patch.patch;
@@ -3185,6 +3161,7 @@ mod tests {
     #[cfg(feature = "kvm")]
     use std::sync::atomic::AtomicU32;
 
+    use vm_device::interrupt::InterruptSourceConfig;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -3637,6 +3614,42 @@ mod tests {
         fn region_write(&self, _index: u32, _offset: u64, _data: &[u8]) {}
     }
 
+    struct MockMsiInterruptGroup {
+        notifiers: Vec<EventFd>,
+        disables: Mutex<usize>,
+    }
+
+    impl InterruptSourceGroup for MockMsiInterruptGroup {
+        fn disable(&self) -> io::Result<()> {
+            *self.disables.lock().unwrap() += 1;
+            Ok(())
+        }
+
+        fn trigger(&self, index: InterruptIndex) -> io::Result<()> {
+            self.notifiers[index as usize].write(1)
+        }
+
+        fn notifier(&self, index: InterruptIndex) -> Option<EventFd> {
+            self.notifiers
+                .get(index as usize)
+                .map(|fd| fd.try_clone().unwrap())
+        }
+
+        fn update(
+            &self,
+            _index: InterruptIndex,
+            _config: InterruptSourceConfig,
+            _masked: bool,
+            _set_gsi: bool,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_gsi(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct MockMsiInterruptManager;
     impl InterruptManager for MockMsiInterruptManager {
         type GroupConfig = MsiIrqGroupConfig;
@@ -3971,6 +3984,14 @@ mod tests {
     }
 
     impl Vfio for MockConfigSpace {
+        fn enable_irq(&self, _irq_index: u32, _event_fds: Vec<&EventFd>) -> Result<(), VfioError> {
+            Ok(())
+        }
+
+        fn disable_irq(&self, _irq_index: u32) -> Result<(), VfioError> {
+            Ok(())
+        }
+
         fn region_read(&self, _index: u32, offset: u64, data: &mut [u8]) {
             let space = self.space.lock().unwrap();
             let start = offset as usize;
@@ -3981,6 +4002,66 @@ mod tests {
             let mut space = self.space.lock().unwrap();
             let start = offset as usize;
             space[start..start + data.len()].copy_from_slice(data);
+        }
+    }
+
+    #[test]
+    fn msix_control_readback_uses_emulated_state() {
+        for width in [1, 2, 4] {
+            let mock = MockConfigSpace::new(&[]);
+            let group = Arc::new(MockMsiInterruptGroup {
+                notifiers: (0..2)
+                    .map(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap())
+                    .collect(),
+                disables: Mutex::new(0),
+            });
+            let mut common = test_vfio_common(Arc::clone(&mock), None);
+            common.interrupt.msix = Some(VfioMsix {
+                bar: MsixConfig::new(
+                    2,
+                    MaybeMutInterruptSourceGroup::Immutable(
+                        Arc::clone(&group) as Arc<dyn InterruptSourceGroup>
+                    ),
+                    0,
+                    None,
+                )
+                .unwrap(),
+                cap: MsixCap::new(0, 2, 0x1000, 0, 0x2000),
+                cap_offset: 0x40,
+                interrupt_source_group: Arc::clone(&group) as Arc<dyn InterruptSourceGroup>,
+            });
+            for (control, expected) in [
+                (0x8000u16, 0x8003_7011u32),
+                (0xc000, 0xc003_7011),
+                (0, 0x0003_7011),
+            ] {
+                match width {
+                    1 => {
+                        common.write_config_register(0x40 / 4, 3, &[(control >> 8) as u8]);
+                    }
+                    2 => {
+                        common.write_config_register(0x40 / 4, 2, &control.to_le_bytes());
+                    }
+                    4 => {
+                        common.write_config_register(
+                            0x40 / 4,
+                            0,
+                            &(u32::from(control) << 16).to_le_bytes(),
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                // Hardware can disagree after VFIO toggles the interrupt mode.
+                mock.write_config_dword(0x40, (!expected & 0xc000_0000) | 0x0003_7011);
+                assert_eq!(
+                    common.read_config_register(0x40 / 4),
+                    expected,
+                    "write width {width}"
+                );
+            }
+            assert_eq!(*group.disables.lock().unwrap(), 2);
+            assert_eq!(common.read_config_register(0x44 / 4), 0x1000);
+            assert_eq!(common.read_config_register(0x48 / 4), 0x2000);
         }
     }
 
