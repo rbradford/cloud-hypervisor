@@ -60,14 +60,13 @@ use crate::configuration::{
     PCI_EXP_FLAGS_VERS_SHIFT, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL2, PCI_EXP_TYPE_RC_END,
     PCI_EXT_CAP_ALIGN, PCI_EXT_CAP_NEXT_MASK, PCI_EXT_CAP_NEXT_SHIFT, PCIE_CONFIG_SPACE_SIZE,
 };
-use crate::msi::{Error as MsiError, MSI_CONFIG_ID, MsiConfigState};
+use crate::msi::{Error as MsiError, MSI_CONFIG_ID, MsiConfigState, msi_num_capable_vectors};
 use crate::msix::{Error as MsixError, MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
     BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap,
     MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
     PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
     PciExpressCapability, PciExpressCapabilityId, PciHeaderType, PciSubclass,
-    msi_num_enabled_vectors,
 };
 
 pub(crate) const VFIO_COMMON_ID: &str = "vfio_common";
@@ -1309,7 +1308,7 @@ impl VfioCommon {
             .msi_interrupt_manager
             .create_group(MsiIrqGroupConfig {
                 base: 0,
-                count: msi_num_enabled_vectors(msg_ctl) as InterruptIndex,
+                count: msi_num_capable_vectors(msg_ctl) as InterruptIndex,
             })
             .map_err(VfioPciError::CreateMsiInterruptGroup)?;
 
@@ -3650,11 +3649,24 @@ mod tests {
         }
     }
 
-    struct MockMsiInterruptManager;
+    #[derive(Default)]
+    struct MockMsiInterruptManager {
+        counts: Mutex<Vec<InterruptIndex>>,
+    }
+
     impl InterruptManager for MockMsiInterruptManager {
         type GroupConfig = MsiIrqGroupConfig;
-        fn create_group(&self, _: MsiIrqGroupConfig) -> io::Result<Arc<dyn InterruptSourceGroup>> {
-            unimplemented!("not exercised by the migration-helper tests")
+        fn create_group(
+            &self,
+            config: MsiIrqGroupConfig,
+        ) -> io::Result<Arc<dyn InterruptSourceGroup>> {
+            self.counts.lock().unwrap().push(config.count);
+            Ok(Arc::new(MockMsiInterruptGroup {
+                notifiers: (0..config.count)
+                    .map(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap())
+                    .collect(),
+                disables: Mutex::new(0),
+            }))
         }
     }
 
@@ -3683,7 +3695,7 @@ mod tests {
                 msi: None,
                 msix: None,
             },
-            msi_interrupt_manager: Arc::new(MockMsiInterruptManager),
+            msi_interrupt_manager: Arc::new(MockMsiInterruptManager::default()),
             legacy_interrupt_group: None,
             vfio_wrapper,
             patches: HashMap::new(),
@@ -4002,6 +4014,38 @@ mod tests {
             let mut space = self.space.lock().unwrap();
             let start = offset as usize;
             space[start..start + data.len()].copy_from_slice(data);
+        }
+    }
+
+    #[test]
+    fn msi_initialization_allocates_advertised_capacity() {
+        for (exponent, count) in [(0u16, 1), (1, 2), (2, 4), (3, 8), (4, 16), (5, 32)] {
+            let mock = MockConfigSpace::new(&[]);
+            let manager = Arc::new(MockMsiInterruptManager::default());
+            let mut common = test_vfio_common(mock, None);
+            common.msi_interrupt_manager =
+                Arc::clone(&manager) as Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>;
+            common.initialize_msi(exponent << 1, 0x40, None).unwrap();
+            assert_eq!(*manager.counts.lock().unwrap(), [count]);
+            assert_eq!(
+                common
+                    .interrupt
+                    .msi
+                    .as_ref()
+                    .unwrap()
+                    .cfg
+                    .num_enabled_vectors(),
+                1
+            );
+            common
+                .update_msi_capabilities(2, &((exponent << 4) | 1).to_le_bytes())
+                .unwrap();
+            let msi = common.interrupt.msi.as_ref().unwrap();
+            assert_eq!(msi.cfg.num_enabled_vectors(), count as usize);
+            for index in 0..count {
+                assert!(msi.interrupt_source_group.notifier(index).is_some());
+            }
+            assert!(msi.interrupt_source_group.notifier(count).is_none());
         }
     }
 

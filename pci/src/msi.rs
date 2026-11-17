@@ -37,6 +37,16 @@ pub fn msi_num_enabled_vectors(msg_ctl: u16) -> usize {
     1 << field
 }
 
+pub(crate) fn msi_num_capable_vectors(msg_ctl: u16) -> usize {
+    let field = (msg_ctl >> 1) & 0x7;
+
+    if field > 5 {
+        return 0;
+    }
+
+    1 << field
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Failed enabling the interrupt route")]
@@ -417,6 +427,22 @@ mod tests {
                 assert_eq!(masked, index % 2 == 1);
                 assert_eq!(set_gsi, !restored);
             }
+        }
+    }
+
+    #[test]
+    fn msi_capable_vector_count_decodes_valid_and_reserved_fields() {
+        for (field, expected) in [
+            (0u16, 1),
+            (1, 2),
+            (2, 4),
+            (3, 8),
+            (4, 16),
+            (5, 32),
+            (6, 0),
+            (7, 0),
+        ] {
+            assert_eq!(msi_num_capable_vectors(0xfff1 | (field << 1)), expected);
         }
     }
 
