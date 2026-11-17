@@ -290,6 +290,11 @@ impl VirtioPciCommonConfig {
 
     fn write_common_config_word(&mut self, offset: u64, value: u16, queues: &mut [Queue]) {
         debug!("write_common_config_word: offset 0x{offset:x}");
+        let value = if matches!(offset, 0x10 | 0x1a) && usize::from(value) > queues.len() {
+            VIRTQ_MSI_NO_VECTOR
+        } else {
+            value
+        };
         match offset {
             0x10 => self.msix_config.store(value, Ordering::Release),
             0x16 => self.queue_select = value,
@@ -636,6 +641,47 @@ mod tests {
             queue_select: 0,
             msix_config: Arc::new(AtomicU16::new(0)),
             msix_queues: Arc::new(Mutex::new(vec![0; 1])),
+        }
+    }
+
+    #[test]
+    fn msix_vector_assignment_rejects_out_of_range() {
+        let mut regs = make_regs(0);
+        let mut queues = vec![Queue::new(QUEUE_SIZE).unwrap()];
+        for offset in [0x10, 0x1a] {
+            for (value, expected) in [
+                (0u16, 0u16),
+                (1, 1),
+                (2, 0xffff),
+                (0xfffe, 0xffff),
+                (0xffff, 0xffff),
+            ] {
+                regs.write(offset, &value.to_le_bytes(), &mut queues);
+                let mut read_back = [0; 2];
+                regs.read(offset, &mut read_back, &queues);
+                assert_eq!(
+                    u16::from_le_bytes(read_back),
+                    expected,
+                    "register {offset:#x}, vector {value:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_queue_selection_preserves_msix_vector() {
+        let mut regs = make_regs(0);
+        let mut queues = vec![Queue::new(QUEUE_SIZE).unwrap()];
+        regs.write(0x1a, &1u16.to_le_bytes(), &mut queues);
+        for selection in [1u16, 0xffff] {
+            regs.write(0x16, &selection.to_le_bytes(), &mut queues);
+            regs.write(0x1a, &0u16.to_le_bytes(), &mut queues);
+            let mut read_back = [0; 2];
+            regs.read(0x1a, &mut read_back, &queues);
+            assert_eq!(u16::from_le_bytes(read_back), VIRTQ_MSI_NO_VECTOR);
+            regs.write(0x16, &0u16.to_le_bytes(), &mut queues);
+            regs.read(0x1a, &mut read_back, &queues);
+            assert_eq!(u16::from_le_bytes(read_back), 1);
         }
     }
 
