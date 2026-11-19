@@ -123,7 +123,7 @@ dirs = "7.0.0"
 env_logger = { version = "0.11.10", default-features = false }
 epoll = "4.4.0"
 getrandom = { version = "0.4.3", features = ["std"] }
-jiff = { version = "0.2", default-features = false, features = [
+jiff = { version = "1.0", default-features = false, features = [
   "std",
   "tz-system",
   "tzdb-zoneinfo",
