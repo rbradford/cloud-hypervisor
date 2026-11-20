@@ -74,7 +74,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::Bus;
-use vm_memory::{Bytes, GuestAddress, GuestAddressSpace};
+use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryBackend};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, snapshot_from_id,
@@ -112,8 +112,8 @@ use crate::vm_config::{
     NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 use crate::{
-    CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemory, GuestMemoryMap,
-    MEMORY_MANAGER_SNAPSHOT_ID, MemoryZoneUpdateError, PciDeviceInfo, acpi, cpu,
+    CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemory, MEMORY_MANAGER_SNAPSHOT_ID,
+    MemoryZoneUpdateError, PciDeviceInfo, acpi, cpu,
 };
 
 /// Errors associated with VM management
@@ -1160,7 +1160,7 @@ impl Vm {
     }
 
     #[cfg(feature = "fw_cfg")]
-    fn populate_fw_cfg_items<#[cfg(target_arch = "x86_64")] M: vm_memory::GuestMemoryBackend>(
+    fn populate_fw_cfg_items<#[cfg(target_arch = "x86_64")] M: GuestMemoryBackend>(
         fw_cfg_config: &FwCfgConfig,
         device_manager: &Arc<Mutex<DeviceManager>>,
         config: &Arc<Mutex<VmConfig>>,
@@ -1473,7 +1473,10 @@ impl Vm {
         Ok(vm)
     }
 
-    fn load_initramfs(&mut self, guest_mem: &GuestMemoryMap) -> Result<arch::InitramfsConfig> {
+    fn load_initramfs<M: GuestMemoryBackend>(
+        &mut self,
+        guest_mem: &M,
+    ) -> Result<arch::InitramfsConfig> {
         let initramfs = self.initramfs.as_mut().unwrap();
         let size: usize = initramfs
             .seek(SeekFrom::End(0))
@@ -3355,8 +3358,7 @@ mod tests {
         use std::sync::atomic::AtomicU32;
 
         use hypervisor::VmExit;
-        use vm_allocator::{GuestRegion, MemorySlotAllocator};
-        use vm_memory::GuestMemoryBackend;
+        use vm_allocator::{GuestMemoryMap, GuestRegion, MemorySlotAllocator};
         // This example based on https://lwn.net/Articles/658511/
         let code = [
             0xba, 0xf8, 0x03, /* mov $0x3f8, %dx */
@@ -3432,6 +3434,7 @@ mod tests {
 mod tests {
     use arch::{DeviceType, MmioDeviceInfo};
     use devices::gic::Gic;
+    use vm_allocator::GuestMemoryMap;
 
     use super::*;
 
