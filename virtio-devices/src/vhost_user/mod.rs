@@ -458,7 +458,7 @@ impl<S: VhostUserFrontendReqHandler> EpollHelperHandler for VhostUserEpollHandle
                     .lock()
                     .unwrap()
                     .resume(
-                        &self.mem.memory(),
+                        self.mem.memory().deref(),
                         &self.queues,
                         self.virtio_interrupt.as_ref(),
                         self.acked_features,
@@ -595,7 +595,7 @@ impl VhostUserCommon {
         vu.lock()
             .unwrap()
             .setup_vhost_user(
-                &mem.memory(),
+                mem.memory().deref(),
                 &queues,
                 interrupt_cb.as_ref(),
                 acked_features,
@@ -1173,7 +1173,7 @@ mod tests {
         .unwrap();
         struct BackendReqHandler;
         impl VhostUserFrontendReqHandler for BackendReqHandler {}
-        vu.setup_vhost_user::<BackendReqHandler>(
+        vu.setup_vhost_user::<BackendReqHandler, _>(
             &mem,
             &[],
             &NoopVirtioInterrupt {},
