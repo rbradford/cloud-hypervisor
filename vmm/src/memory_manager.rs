@@ -1140,7 +1140,7 @@ impl MemoryManager {
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
         let guest_memory = self.guest_memory.memory();
-        if !is_restore_cow_compatible(&guest_memory, saved_regions) {
+        if !is_restore_cow_compatible(&*guest_memory, saved_regions) {
             info!("Restore (mode=copyonwrite): guest RAM unsuitable, falling back to copy");
             return self.fill_saved_regions(file_path, saved_regions);
         }
@@ -1157,7 +1157,7 @@ impl MemoryManager {
                 "snapshot memory file is shorter than the saved ranges",
             )));
         }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        do_mmap_cow_saved_regions(&*guest_memory, &memory_file, saved_regions, self.thp)?;
         // Landlock applies after the restore, so the pagemap is opened here.
         self.cow_source = match PageMap::open() {
             Ok(pagemap) => Some(CowSource {
@@ -4015,8 +4015,8 @@ fn write_private_pages<M: GuestMemoryBackend>(
 // single plain private-anonymous guest region — the MAP_FIXED overlay
 // preconditions. File-backed regions are rejected: their stale mapping
 // metadata would misdirect a later snapshot or fd consumer.
-fn is_restore_cow_compatible(
-    guest_memory: &GuestMemoryMap,
+fn is_restore_cow_compatible<M: GuestMemoryBackend>(
+    guest_memory: &M,
     saved_regions: &MemoryRangeTable,
 ) -> bool {
     let page_size = get_page_size();
@@ -4050,8 +4050,8 @@ fn is_restore_cow_compatible(
 // Maps each saved range over its guest RAM window, re-applying the owning
 // region's reserve policy and the THP policy. Ranges must have passed
 // `is_restore_cow_compatible`.
-fn do_mmap_cow_saved_regions(
-    guest_memory: &GuestMemoryMap,
+fn do_mmap_cow_saved_regions<M: GuestMemoryBackend<R = GuestRegion>>(
+    guest_memory: &M,
     memory_file: &File,
     saved_regions: &MemoryRangeTable,
     thp: bool,
