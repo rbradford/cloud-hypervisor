@@ -800,17 +800,24 @@ impl AddressManager {
         if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>()
             && bar_idx == VIRTIO_CONFIG_BAR_INDEX
         {
-            for (event, addr) in virtio_pci_dev.ioeventfds(old_base) {
-                let io_addr = IoEventAddress::Mmio(addr);
-                self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
-                    io::Error::other(format!("failed to unregister ioevent: {e:?}"))
-                })?;
+            // The notifications of an unassigned BAR have no address.
+            if old_base != 0 {
+                for (event, addr) in virtio_pci_dev.ioeventfds(old_base) {
+                    let io_addr = IoEventAddress::Mmio(addr);
+                    self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
+                        io::Error::other(format!("failed to unregister ioevent: {e:?}"))
+                    })?;
+                }
             }
-            for (event, addr) in virtio_pci_dev.ioeventfds(new_base) {
-                let io_addr = IoEventAddress::Mmio(addr);
-                self.vm
-                    .register_ioevent(event, &io_addr, None)
-                    .map_err(|e| io::Error::other(format!("failed to register ioevent: {e:?}")))?;
+            if new_base != 0 {
+                for (event, addr) in virtio_pci_dev.ioeventfds(new_base) {
+                    let io_addr = IoEventAddress::Mmio(addr);
+                    self.vm
+                        .register_ioevent(event, &io_addr, None)
+                        .map_err(|e| {
+                            io::Error::other(format!("failed to register ioevent: {e:?}"))
+                        })?;
+                }
             }
         }
 
@@ -5218,12 +5225,16 @@ impl DeviceManager {
             .find(|bar| bar.idx() == VIRTIO_CONFIG_BAR_INDEX)
             .unwrap()
             .addr();
-        for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
-            let io_addr = IoEventAddress::Mmio(addr);
-            self.address_manager
-                .vm
-                .register_ioevent(event, &io_addr, None)
-                .map_err(DeviceManagerError::RegisterIoevent)?;
+        // The notifications of an unassigned BAR are registered once the
+        // guest assigns it.
+        if bar_addr != 0 {
+            for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
+                let io_addr = IoEventAddress::Mmio(addr);
+                self.address_manager
+                    .vm
+                    .register_ioevent(event, &io_addr, None)
+                    .map_err(DeviceManagerError::RegisterIoevent)?;
+            }
         }
 
         // Update the device tree with correct resource information.
@@ -5728,7 +5739,9 @@ impl DeviceManager {
                             }
                             _ => None,
                         });
-                        if let Some(bar_addr) = bar_addr {
+                        if let Some(bar_addr) = bar_addr
+                            && bar_addr != 0
+                        {
                             for (event, addr) in dev.ioeventfds(bar_addr) {
                                 let io_addr = IoEventAddress::Mmio(addr);
                                 self.address_manager
