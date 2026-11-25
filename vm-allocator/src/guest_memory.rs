@@ -157,7 +157,8 @@ impl GuestRegion {
         Ok(region)
     }
 
-    /// Register the region with the hypervisor.
+    /// Register the region with the hypervisor. Callers must not register
+    /// and unregister the same region concurrently.
     pub fn register(&self) -> Result<(), Error> {
         let vm = self.vm.as_ref().ok_or(Error::MissingVm)?;
         // Prevent concurrent calls from registering the same slot twice.
@@ -232,6 +233,40 @@ impl GuestRegion {
     /// The reserved slot, including before registration.
     pub fn slot(&self) -> Option<u32> {
         self.slot
+    }
+
+    /// Remove the region's registration with the hypervisor. The slot stays
+    /// reserved so the region can be registered again. The region reads as
+    /// unregistered while its slot is removed, so callers must not register
+    /// and unregister the same region concurrently.
+    pub fn unregister(&self) -> Result<(), Error> {
+        if self
+            .registered
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        // A registered region always has a VM.
+        let vm = self.vm.as_ref().unwrap();
+        let guest_phys_addr = self.region.start_addr().raw_value();
+        // SAFETY: the region keeps its mapping alive until after slot removal.
+        if let Err(e) = unsafe {
+            vm.remove_user_memory_region(
+                self.slot.unwrap(),
+                guest_phys_addr,
+                self.region.size(),
+                self.region.as_ptr(),
+                false,
+            )
+        } {
+            self.registered.store(true, Ordering::Release);
+            return Err(Error::RemoveRegion(e));
+        }
+
+        info!("Removed userspace mapping at {guest_phys_addr:#x}");
+
+        Ok(())
     }
 
     /// Whether the region is registered or registration is in progress.
