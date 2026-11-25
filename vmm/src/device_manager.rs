@@ -517,14 +517,6 @@ pub enum DeviceManagerError {
     #[error("Could not find the node in the device tree")]
     MissingNode,
 
-    /// Resource was already found.
-    #[error("Resource was already found")]
-    ResourceAlreadyExists,
-
-    /// Expected resources for virtio-pmem could not be found.
-    #[error("Expected resources for virtio-pmem could not be found")]
-    MissingVirtioPmemResources,
-
     /// Missing PCI b/d/f from the DeviceNode.
     #[error("Missing PCI b/d/f from the DeviceNode")]
     MissingDeviceNodePciBdf,
@@ -3646,35 +3638,14 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
-        // Look for the id in the device tree. If it can be found, that means
-        // the device is being restored, otherwise it's created from scratch.
-        let region_range = if let Some(node) = self.device_tree.lock().unwrap().get(&id) {
-            info!("Restoring virtio-pmem {id} resources");
-
-            let mut region_range: Option<(u64, u64)> = None;
-            for resource in node.resources.iter() {
-                match resource {
-                    Resource::MmioAddressRange { base, size } => {
-                        if region_range.is_some() {
-                            return Err(DeviceManagerError::ResourceAlreadyExists);
-                        }
-
-                        region_range = Some((*base, *size));
-                    }
-                    _ => {
-                        error!("Unexpected resource {resource:?} for {id}");
-                    }
-                }
-            }
-
-            if region_range.is_none() {
-                return Err(DeviceManagerError::MissingVirtioPmemResources);
-            }
-
-            region_range
-        } else {
-            None
-        };
+        // A snapshot from before the memory moved into the shared memory BAR
+        // records the fixed address where its guest expects the memory.
+        let legacy_base = self.device_tree.lock().unwrap().get(&id).and_then(|node| {
+            node.resources.iter().find_map(|resource| match resource {
+                Resource::MmioAddressRange { base, .. } => Some(*base),
+                _ => None,
+            })
+        });
 
         let (custom_flags, set_len) = if pmem_cfg.file.is_dir() {
             if pmem_cfg.size.is_none() {
@@ -3707,38 +3678,10 @@ impl DeviceManager {
             return Err(DeviceManagerError::PmemSizeNotAligned);
         }
 
-        let (region_base, region_size) = if let Some((base, size)) = region_range {
-            // The memory needs to be 2MiB aligned in order to support
-            // hugepages.
-            self.pci_segments[pmem_cfg.pci_common.pci_segment as usize]
-                .mem64_allocator
-                .lock()
-                .unwrap()
-                .allocate(
-                    Some(GuestAddress(base)),
-                    size as GuestUsize,
-                    Some(0x0020_0000),
-                )
-                .ok_or(DeviceManagerError::PmemRangeAllocation)?;
-
-            (base, size)
-        } else {
-            // The memory needs to be 2MiB aligned in order to support
-            // hugepages.
-            let base = self.pci_segments[pmem_cfg.pci_common.pci_segment as usize]
-                .mem64_allocator
-                .lock()
-                .unwrap()
-                .allocate(None, size as GuestUsize, Some(0x0020_0000))
-                .ok_or(DeviceManagerError::PmemRangeAllocation)?;
-
-            (base.raw_value(), size)
-        };
-
         let cloned_file = file.try_clone().map_err(DeviceManagerError::CloneFile)?;
         let mmap_region = MmapRegion::build(
             Some(FileOffset::new(cloned_file, 0)),
-            region_size as usize,
+            size as usize,
             PROT_READ | PROT_WRITE,
             MAP_NORESERVE
                 | if pmem_cfg.discard_writes {
@@ -3748,9 +3691,12 @@ impl DeviceManager {
                 },
         )
         .map_err(DeviceManagerError::NewMmapRegion)?;
+        // The memory is mapped at the recorded address for a device restored
+        // from an older release, and otherwise once the guest assigns the
+        // shared memory BAR.
         let mapping = GuestRegion::from_mmap(
             mmap_region,
-            GuestAddress(region_base),
+            GuestAddress(legacy_base.unwrap_or_default()),
             Arc::clone(&self.address_manager.vm),
             Arc::clone(self.memory_manager.lock().unwrap().memory_slot_allocator()),
             false,
@@ -3759,15 +3705,25 @@ impl DeviceManager {
             hypervisor::MemoryVisibility::Shared,
         )
         .map_err(DeviceManagerError::RegisterGuestRegion)?;
-        mapping
-            .register()
-            .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        if let Some(base) = legacy_base {
+            // Keep the BARs the VMM allocates off the memory.
+            self.pci_segments[pmem_cfg.pci_common.pci_segment as usize]
+                .mem64_allocator
+                .lock()
+                .unwrap()
+                .allocate(Some(GuestAddress(base)), size, None)
+                .ok_or(DeviceManagerError::PmemRangeAllocation)?;
+            mapping
+                .register()
+                .map_err(DeviceManagerError::RegisterGuestRegion)?;
+            node.resources
+                .push(Resource::MmioAddressRange { base, size });
+        }
 
         let virtio_pmem_device = Arc::new(Mutex::new(
             virtio_devices::Pmem::new(
                 id.clone(),
                 file,
-                GuestAddress(region_base),
                 mapping,
                 self.force_access_platform | pmem_cfg.pci_common.iommu.attached(),
                 self.seccomp_action.clone(),
@@ -3780,12 +3736,7 @@ impl DeviceManager {
             .map_err(DeviceManagerError::CreateVirtioPmem)?,
         ));
 
-        // Update the device tree with correct resource information and with
-        // the migratable device.
-        node.resources.push(Resource::MmioAddressRange {
-            base: region_base,
-            size: region_size,
-        });
+        // Update the device tree with the migratable device.
         node.migratable = Some(Arc::clone(&virtio_pmem_device) as Arc<Mutex<dyn Migratable>>);
         self.device_tree.lock().unwrap().insert(id.clone(), node);
 

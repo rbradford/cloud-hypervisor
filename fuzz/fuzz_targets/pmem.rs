@@ -150,7 +150,7 @@ fn run_restore_case(cursor: &mut FuzzCursor<'_>) -> bool {
         Err(_) => return false,
     };
 
-    let (file, guest_addr, mapping) = match create_backing_file_and_mapping() {
+    let (file, mapping) = match create_backing_file_and_mapping() {
         Ok(parts) => parts,
         Err(_) => return false,
     };
@@ -162,7 +162,6 @@ fn run_restore_case(cursor: &mut FuzzCursor<'_>) -> bool {
     let mut restored = match Pmem::new(
         "restored".to_owned(),
         file,
-        guest_addr,
         mapping,
         true,
         SeccompAction::Allow,
@@ -486,7 +485,7 @@ impl AccessPlatform for FuzzAccessPlatform {
     }
 }
 
-fn create_backing_file_and_mapping() -> io::Result<(File, GuestAddress, GuestRegion)> {
+fn create_backing_file_and_mapping() -> io::Result<(File, GuestRegion)> {
     let shm = memfd_create_with_size(&ffi::CString::new("fuzz").unwrap(), 0, PMEM_FILE_SIZE)?;
     let file: File = unsafe { File::from_raw_fd(shm) };
 
@@ -499,16 +498,15 @@ fn create_backing_file_and_mapping() -> io::Result<(File, GuestAddress, GuestReg
         MAP_NORESERVE | MAP_PRIVATE,
     )
     .map_err(|e| io::Error::other(format!("failed building mmap region: {e}")))?;
-    let guest_addr = GuestAddress(0);
-    let dummy_user_mapping = vm_memory::GuestRegionMmap::new(dummy_mmap_region, guest_addr)
+    let dummy_user_mapping = vm_memory::GuestRegionMmap::new(dummy_mmap_region, GuestAddress(0))
         .unwrap()
         .into();
 
-    Ok((file, guest_addr, dummy_user_mapping))
+    Ok((file, dummy_user_mapping))
 }
 
 fn create_dummy_pmem(access_platform_enabled: bool, fail_flush: bool) -> io::Result<Pmem> {
-    let (file, guest_addr, dummy_user_mapping) = create_backing_file_and_mapping()?;
+    let (file, dummy_user_mapping) = create_backing_file_and_mapping()?;
     let disk = if fail_flush {
         OpenOptions::new()
             .read(true)
@@ -521,7 +519,6 @@ fn create_dummy_pmem(access_platform_enabled: bool, fail_flush: bool) -> io::Res
     Pmem::new(
         "tmp".to_owned(),
         disk,
-        guest_addr,
         dummy_user_mapping,
         access_platform_enabled,
         SeccompAction::Allow,

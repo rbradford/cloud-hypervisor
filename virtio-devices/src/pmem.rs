@@ -9,7 +9,7 @@
 use std::fs::File;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -22,7 +22,7 @@ use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_allocator::GuestRegion;
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryBackend,
-    GuestMemoryError,
+    GuestMemoryError, GuestMemoryRegion,
 };
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
@@ -34,13 +34,17 @@ use super::{
     EpollHelperHandler, Error as DeviceError, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1,
     VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
-use crate::device::ActivationContext;
+use crate::device::{ActivationContext, VirtioSharedMemory, VirtioSharedMemoryList};
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::PauseCommon;
 use crate::{GuestMemory, VirtioInterrupt, VirtioInterruptType};
 
 const QUEUE_SIZE: u16 = 256;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
+
+// The device memory is a shared memory region, at the address the guest
+// assigns to its BAR.
+const VIRTIO_PMEM_F_SHMEM_REGION: u64 = 0;
 
 const VIRTIO_PMEM_REQ_TYPE_FLUSH: u32 = 0;
 const VIRTIO_PMEM_RESP_TYPE_OK: u32 = 0;
@@ -270,7 +274,7 @@ pub struct Pmem {
     id: String,
     disk: Option<File>,
     config: VirtioPmemConfig,
-    _mapping: GuestRegion,
+    mapping: Arc<Mutex<GuestRegion>>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
 }
@@ -283,11 +287,11 @@ pub struct PmemState {
 }
 
 impl Pmem {
-    #[expect(clippy::too_many_arguments)]
+    /// `mapping` holds the device memory, which the guest maps by assigning
+    /// the shared memory BAR.
     pub fn new(
         id: String,
         disk: File,
-        addr: GuestAddress,
         mapping: GuestRegion,
         access_platform_enabled: bool,
         seccomp_action: SeccompAction,
@@ -304,11 +308,12 @@ impl Pmem {
             )
         } else {
             let config = VirtioPmemConfig {
-                start: addr.raw_value().to_le(),
+                start: 0,
                 size: (mapping.size() as u64).to_le(),
             };
 
-            let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
+            let mut avail_features =
+                (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_PMEM_F_SHMEM_REGION);
 
             if access_platform_enabled {
                 avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
@@ -328,7 +333,7 @@ impl Pmem {
             id,
             disk: Some(disk),
             config,
-            _mapping: mapping,
+            mapping: Arc::new(Mutex::new(mapping)),
             seccomp_action,
             exit_evt,
         })
@@ -366,7 +371,19 @@ impl VirtioDevice for Pmem {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.as_slice(), offset, data);
+        // A driver without VIRTIO_PMEM_F_SHMEM_REGION finds the memory at the
+        // address of the shared memory BAR.
+        let config = VirtioPmemConfig {
+            start: self
+                .mapping
+                .lock()
+                .unwrap()
+                .start_addr()
+                .raw_value()
+                .to_le(),
+            ..self.config
+        };
+        self.read_config_from_slice(config.as_slice(), offset, data);
     }
 
     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
@@ -428,6 +445,21 @@ impl VirtioDevice for Pmem {
 
     fn is_removable(&self) -> bool {
         true
+    }
+
+    fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
+        // A device restored from a snapshot that predates the shared memory
+        // region keeps its memory at the address in its configuration.
+        if self.common.avail_features & (1u64 << VIRTIO_PMEM_F_SHMEM_REGION) == 0 {
+            return None;
+        }
+        Some(VirtioSharedMemoryList {
+            mapping: Arc::clone(&self.mapping),
+            region_list: vec![VirtioSharedMemory {
+                offset: 0,
+                len: u64::from_le(self.config.size),
+            }],
+        })
     }
 }
 
