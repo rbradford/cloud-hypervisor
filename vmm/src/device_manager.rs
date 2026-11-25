@@ -5355,9 +5355,13 @@ impl DeviceManager {
             hypervisor::MemoryVisibility::Shared,
         )
         .map_err(DeviceManagerError::RegisterGuestRegion)?;
-        region
-            .register()
-            .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        // The shared memory of an unassigned BAR is mapped once the guest
+        // assigns it.
+        if start_addr != 0 {
+            region
+                .register()
+                .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        }
         ivshmem_device.lock().unwrap().set_region(region);
 
         let mut node = device_node!(id, ivshmem_device);
