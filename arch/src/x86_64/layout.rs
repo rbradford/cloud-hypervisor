@@ -125,3 +125,7 @@ pub const RAM_64BIT_START: GuestAddress = GuestAddress(0x1_0000_0000);
 // ** AMD HyperTransport range (start: 1012GiB, length: 12GiB) **
 pub const AMD_HYPER_TRANSPORT_HOLE_START: GuestAddress = GuestAddress(0xfd_0000_0000);
 pub const AMD_HYPER_TRANSPORT_HOLE_SIZE: u64 = 0x3_0000_0000;
+
+// ** PCI I/O window (start: 0x1000, end: 0xffff) **
+// Above the I/O ports of the platform devices.
+pub const PCI_IO_WINDOW_START: u16 = 0x1000;
