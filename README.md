@@ -89,15 +89,9 @@ kernel must be built with PVH support or be a bzImage. The second is
 firmware boot, where a firmware image is passed to `--firmware` and
 brings up the guest's normal boot loader.
 
-Two firmware options are supported, and which one works best depends
-on the guest OS. [Rust Hypervisor
-Firmware](https://github.com/cloud-hypervisor/rust-hypervisor-firmware)
-is a lightweight Rust-based PVH firmware. The edk2 UEFI firmware is
-called `CLOUDHV.fd` for x86-64 and `CLOUDHV_EFI.fd` for AArch64.
-Prebuilt binaries for both are available at their respective releases
-pages, [Rust Hypervisor
-Firmware](https://github.com/cloud-hypervisor/rust-hypervisor-firmware/releases/latest)
-and [our edk2
+The supported firmware is the edk2 UEFI firmware, called `CLOUDHV.fd`
+for x86-64 and `CLOUDHV_EFI.fd` for AArch64. Prebuilt binaries are
+available on the releases page of [our edk2
 fork](https://github.com/cloud-hypervisor/edk2/releases/latest).
 The edk2 fork carries customizations required to boot AArch64 guests
 on cloud-hypervisor. See [docs/uefi.md](docs/uefi.md) for differences
@@ -116,7 +110,7 @@ boot the image with. Cloud images of other recent distributions work as well.
 $ wget -O cloudimg-amd64.img \
   https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
 $ qemu-img convert -p -f qcow2 -O raw cloudimg-amd64.img cloudimg-amd64.raw
-$ wget https://github.com/cloud-hypervisor/rust-hypervisor-firmware/releases/latest/download/hypervisor-fw
+$ wget https://github.com/cloud-hypervisor/edk2/releases/latest/download/CLOUDHV.fd
 ```
 
 The Ubuntu cloud images do not ship with a default password so it necessary to
@@ -134,7 +128,7 @@ and assigns the host side IP address `192.168.249.1`.
 $ sudo setcap cap_net_admin+ep ./cloud-hypervisor
 $ ./scripts/create-cloud-init.sh
 $ ./cloud-hypervisor \
-	--firmware ./hypervisor-fw \
+	--firmware ./CLOUDHV.fd \
 	--disk path=cloudimg-amd64.raw,image_type=raw \
 		path=/tmp/ubuntu-cloudinit.img,image_type=raw \
 	--cpus boot=4 \
@@ -153,10 +147,6 @@ to load a payload/bootitem(s):
 
 - Provide firmware
 - Provide kernel \[+ cmdline\]\ [+ initrd\]
-
-Please note that our Cloud Hypervisor firmware (`hypervisor-fw`) has a Xen PVH
-boot entry, therefore it can also be booted via the `--kernel` parameter, as
-seen in some examples.
 
 ### Custom Kernel and Disk Image
 
