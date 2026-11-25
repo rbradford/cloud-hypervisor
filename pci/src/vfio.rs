@@ -99,6 +99,8 @@ pub enum VfioPciError {
     GetInterruptNotifier(#[source] io::Error),
     #[error("Failed to create user memory region")]
     CreateUserMemoryRegion(#[source] GuestRegionError),
+    #[error("Failed to remove user memory region")]
+    RemoveUserMemoryRegion(#[source] GuestRegionError),
     #[error("Failed to DMA map: {0} for device {1} (guest BDF: {2})")]
     DmaMap(#[source] vfio_ioctls::VfioError, PathBuf, PciBdf),
     #[cfg(feature = "kvm")]
@@ -405,6 +407,10 @@ impl VfioBarMemoryRegion {
         p2p_mapping.lock().unwrap().unmap_p2p(&region)
     }
 
+    fn is_registered(&self) -> bool {
+        self.region.lock().unwrap().is_registered()
+    }
+
     /// Move the region to `address`. A region that is not registered is
     /// only registered again if `register` is set.
     fn place(&mut self, address: u64, register: bool, map_p2p: bool) -> Result<(), VfioPciError> {
@@ -423,6 +429,19 @@ impl VfioBarMemoryRegion {
             self.map_for_p2p()?;
         }
         Ok(())
+    }
+
+    /// Unmap the region from the guest, as its BAR is unassigned.
+    fn unassign(&mut self) -> Result<(), VfioPciError> {
+        self.unmap_p2p().map_err(VfioPciError::DmaUnmap)?;
+        self.region
+            .lock()
+            .unwrap()
+            .unregister()
+            .map_err(VfioPciError::RemoveUserMemoryRegion)?;
+        // An unassigned BAR is at address zero.
+        self.move_region(self.offset)
+            .map_err(VfioPciError::MoveBarMemoryRegion)
     }
 }
 
@@ -543,6 +562,10 @@ unsafe impl VfioBarRange for Vec<VfioBar> {
                 .map_or(region.start.raw_value(), |entry| {
                     entry.start() - entry.offset
                 });
+            // An unassigned BAR is at address zero.
+            if start == 0 {
+                continue;
+            }
             let Some(region_end) = start.checked_add(region.length) else {
                 return false;
             };
@@ -559,6 +582,10 @@ unsafe impl VfioBarRange for Vec<VfioBar> {
             for bar_memory_region in region.bar_memory_regions.iter() {
                 let mapping = bar_memory_region.region.lock().unwrap();
                 let start = mapping.start_addr().raw_value();
+                // An unassigned BAR is at address zero.
+                if start == bar_memory_region.offset {
+                    continue;
+                }
                 let len = mapping.len();
                 // See if the guest address is inside the region.
                 let Some(offset_from_start) = guest_addr.checked_sub(start) else {
@@ -965,34 +992,53 @@ impl VfioCommon {
             if region.index as usize != bar_idx || region.start == GuestAddress(new_base) {
                 continue;
             }
+            // The memory of an unassigned BAR, at address zero, is not mapped.
             let moves = region
                 .bar_memory_regions
                 .iter()
                 .map(|bar_memory_region| {
-                    let new_address = new_base.checked_add(bar_memory_region.offset).ok_or(
-                        VfioPciError::BarAddressOverflow {
-                            base: new_base,
-                            offset: bar_memory_region.offset,
-                        },
-                    )?;
-                    let size = bar_memory_region.size() as u64;
-                    new_address
-                        .checked_add(size)
-                        .ok_or(VfioPciError::BarRangeOverflow {
-                            address: new_address,
-                            size,
-                        })?;
+                    let new_address = if new_base == 0 {
+                        None
+                    } else {
+                        let new_address = new_base.checked_add(bar_memory_region.offset).ok_or(
+                            VfioPciError::BarAddressOverflow {
+                                base: new_base,
+                                offset: bar_memory_region.offset,
+                            },
+                        )?;
+                        let size = bar_memory_region.size() as u64;
+                        new_address
+                            .checked_add(size)
+                            .ok_or(VfioPciError::BarRangeOverflow {
+                                address: new_address,
+                                size,
+                            })?;
+                        Some(new_address)
+                    };
                     Ok((
                         bar_memory_region.start(),
-                        new_address,
+                        bar_memory_region.is_registered(),
                         bar_memory_region.p2p_mapped(),
+                        new_address,
                     ))
                 })
                 .collect::<Result<Vec<_>, VfioPciError>>()?;
-            for (i, &(_, new_address, map_p2p)) in moves.iter().enumerate() {
+            let assigned = region.start.raw_value() != 0;
+            for (i, &(_, _, was_mapped, new_address)) in moves.iter().enumerate() {
                 let bar_memory_region = &mut region.bar_memory_regions[i];
-                if let Err(e) = bar_memory_region.place(new_address, false, map_p2p) {
-                    for (bar_memory_region, &(old_address, _, was_mapped)) in region
+                // The guest assigning the BAR for the first time maps its
+                // memory, including for peer to peer DMA.
+                let map_p2p = if assigned {
+                    was_mapped
+                } else {
+                    bar_memory_region.p2p_mapping.is_some()
+                };
+                let result = match new_address {
+                    Some(new_address) => bar_memory_region.place(new_address, !assigned, map_p2p),
+                    None => bar_memory_region.unassign(),
+                };
+                if let Err(e) = result {
+                    for (bar_memory_region, &(old_address, was_registered, was_mapped, _)) in region
                         .bar_memory_regions[..=i]
                         .iter_mut()
                         .zip(&moves[..=i])
@@ -1000,13 +1046,16 @@ impl VfioCommon {
                     {
                         if bar_memory_region.start() == old_address
                             && bar_memory_region.p2p_mapped() == was_mapped
-                            && bar_memory_region.region.lock().unwrap().is_registered()
+                            && bar_memory_region.is_registered() == was_registered
                         {
                             continue;
                         }
-                        if let Err(rollback) =
+                        let rollback = if assigned {
                             bar_memory_region.place(old_address, true, was_mapped)
-                        {
+                        } else {
+                            bar_memory_region.unassign()
+                        };
+                        if let Err(rollback) = rollback {
                             // Continuing would leave the BAR with inconsistent mappings.
                             error!("FATAL: Failed to restore BAR mapping: {rollback:?}");
                             process::exit(1);
@@ -2856,9 +2905,13 @@ impl VfioPciDevice {
                         VfioPciError::MmapArea
                     })?;
 
-                    mapping
-                        .register()
-                        .map_err(VfioPciError::CreateUserMemoryRegion)?;
+                    // An unassigned BAR is mapped once the guest assigns it.
+                    let assigned = region.start.raw_value() != 0;
+                    if assigned {
+                        mapping
+                            .register()
+                            .map_err(VfioPciError::CreateUserMemoryRegion)?;
+                    }
                     let bar_memory_region = VfioBarMemoryRegion {
                         offset: area.offset,
                         region: Arc::new(Mutex::new(mapping)),
@@ -2878,7 +2931,7 @@ impl VfioPciDevice {
                     };
                     // Map the MMIO BAR into the host IOMMU address space via VfioOps
                     // Only needed if p2p_dma is enabled.
-                    if map_p2p {
+                    if map_p2p && assigned {
                         bar_memory_region.map_for_p2p()?;
                     }
                     region.bar_memory_regions.push(bar_memory_region);
@@ -2917,6 +2970,10 @@ impl VfioPciDevice {
         };
 
         for mmio_region in self.common.bars.iter_mut() {
+            // An unassigned BAR has no memory mapped for peer to peer DMA.
+            if mmio_region.start.raw_value() == 0 {
+                continue;
+            }
             for bar_memory_region in mmio_region.bar_memory_regions.iter_mut() {
                 let Some(p2p_mapping) = &bar_memory_region.p2p_mapping else {
                     continue;
@@ -3444,6 +3501,74 @@ mod tests {
             assert_eq!(mapping.slot(), Some(slots[i]));
             assert!(mapping.is_registered());
         }
+    }
+
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn move_bar_maps_areas_only_while_assigned() {
+        let page_size = get_page_size();
+        let vm = hypervisor::new()
+            .unwrap()
+            .create_vm(hypervisor::HypervisorVmConfig::default())
+            .unwrap();
+        let slot_allocator = Arc::new(MemorySlotAllocator::new(
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        // The areas of an unassigned BAR sit at their offsets, unregistered.
+        let regions = [0, 2 * page_size]
+            .into_iter()
+            .map(|offset| VfioBarMemoryRegion {
+                offset,
+                region: Arc::new(Mutex::new(
+                    GuestRegion::from_mmap(
+                        vm_memory::MmapRegion::new(page_size as usize).unwrap(),
+                        GuestAddress(offset),
+                        Arc::clone(&vm),
+                        Arc::clone(&slot_allocator),
+                        false,
+                        false,
+                        false,
+                        hypervisor::MemoryVisibility::Shared,
+                    )
+                    .unwrap(),
+                )),
+                p2p_mapping: None,
+            })
+            .collect();
+        let mut common = test_vfio_common(Arc::new(DefaultVfio), None);
+        common.bars.push(VfioBar {
+            start: GuestAddress(0),
+            length: 4 * page_size,
+            type_: PciBarRegionType::Memory32BitRegion,
+            index: 0,
+            bar_memory_regions: regions,
+        });
+        let lookup_regions = common.bars.clone();
+        assert!(!lookup_regions.check_range(0, page_size));
+        lookup_regions.find_user_address(0, page_size).unwrap_err();
+
+        let base = 16 * page_size;
+        common.move_bar(0, base).unwrap();
+        assert_eq!(common.bars[0].start, GuestAddress(base));
+        for entry in common.bars[0].bar_memory_regions.iter() {
+            let mapping = entry.region.lock().unwrap();
+            assert_eq!(mapping.start_addr(), GuestAddress(base + entry.offset));
+            assert!(mapping.is_registered());
+        }
+        assert!(lookup_regions.check_range(base, 4 * page_size));
+        lookup_regions
+            .find_user_address(base + 2 * page_size, page_size)
+            .unwrap();
+
+        common.move_bar(0, 0).unwrap();
+        assert_eq!(common.bars[0].start, GuestAddress(0));
+        for entry in common.bars[0].bar_memory_regions.iter() {
+            let mapping = entry.region.lock().unwrap();
+            assert_eq!(mapping.start_addr(), GuestAddress(entry.offset));
+            assert!(!mapping.is_registered());
+        }
+        assert!(!lookup_regions.check_range(base, page_size));
     }
 
     #[cfg(feature = "kvm")]

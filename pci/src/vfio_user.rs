@@ -191,9 +191,12 @@ impl VfioUserPciDevice {
                         Arc::clone(&self.memory_slot_allocator),
                     )
                     .map_err(|e| VfioUserPciDeviceError::Other(io::Error::other(e)))?;
-                    mapping
-                        .register()
-                        .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
+                    // An unassigned BAR is mapped once the guest assigns it.
+                    if mmio_region.start.raw_value() != 0 {
+                        mapping
+                            .register()
+                            .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
+                    }
                     let mapping = Arc::new(Mutex::new(mapping));
 
                     let bar_memory_region = VfioBarMemoryRegion {
