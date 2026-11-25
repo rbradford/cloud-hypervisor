@@ -21,6 +21,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Seek, SeekFrom, stdout};
 use std::num::Wrapping;
+use std::ops::RangeInclusive;
 #[cfg(feature = "kvm")]
 use std::os::fd::BorrowedFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -1211,6 +1212,30 @@ fn create_mmio_allocators(
     Ok(mmio_allocators.into_boxed_slice())
 }
 
+/// Remove the reserved ranges, given as sorted `[base, end)` spans, from the
+/// inclusive `window`, so that the guest does not assign BARs over them.
+fn exclude_reserved(
+    window: RangeInclusive<u64>,
+    reserved: &[(u64, u64)],
+) -> Vec<RangeInclusive<u64>> {
+    let (mut start, end) = window.into_inner();
+    let mut ranges = Vec::new();
+    for &(base, limit) in reserved {
+        if limit <= start || base > end {
+            continue;
+        }
+        if base > start {
+            ranges.push(start..=base - 1);
+        }
+        if limit > end {
+            return ranges;
+        }
+        start = limit;
+    }
+    ranges.push(start..=end);
+    ranges
+}
+
 fn use_64bit_bar_for_virtio_device(
     device_type: u32,
     pci_segment_id: u16,
@@ -1304,11 +1329,19 @@ impl DeviceManager {
         )?;
 
         // Keep BARs off reserved ranges.
-        for (base, end) in memory_manager.lock().unwrap().reserved_regions() {
+        let reserved_regions = memory_manager.lock().unwrap().reserved_regions();
+        for &(base, end) in &reserved_regions {
             for allocator in pci_mmio64_allocators.iter() {
                 claim_reserved(&mut allocator.lock().unwrap(), base, end)?;
             }
         }
+        let pci_mmio64_ranges: Vec<_> = pci_mmio64_allocators
+            .iter()
+            .map(|allocator| {
+                let allocator = allocator.lock().unwrap();
+                exclude_reserved(allocator.base().0..=allocator.end().0, &reserved_regions)
+            })
+            .collect();
 
         let address_manager = Arc::new(AddressManager {
             allocator: memory_manager.lock().unwrap().allocator(),
@@ -1348,6 +1381,7 @@ impl DeviceManager {
             &address_manager,
             Arc::clone(&address_manager.pci_mmio32_allocators[0]),
             Arc::clone(&address_manager.pci_mmio64_allocators[0]),
+            pci_mmio64_ranges[0].clone(),
             &pci_irq_slots,
             #[cfg(target_arch = "x86_64")]
             state_from_id(snapshot, pci::PCI_CONFIG_IO_SNAPSHOT_ID)
@@ -1365,6 +1399,7 @@ impl DeviceManager {
                 &address_manager,
                 Arc::clone(&address_manager.pci_mmio32_allocators[i]),
                 Arc::clone(&address_manager.pci_mmio64_allocators[i]),
+                pci_mmio64_ranges[i].clone(),
                 &pci_irq_slots,
                 state
                     .as_ref()
@@ -6894,6 +6929,7 @@ mod tests {
             &address_manager,
             Arc::clone(&allocator),
             Arc::clone(&allocator),
+            vec![RangeInclusive::new(0x1000_0000, 0x1fff_ffff)],
             &[0; 32],
             None,
         )
@@ -6911,6 +6947,7 @@ mod tests {
             &address_manager,
             Arc::clone(&allocator),
             allocator,
+            vec![RangeInclusive::new(0x1000_0000, 0x1fff_ffff)],
             &[0; 32],
             #[cfg(target_arch = "x86_64")]
             None,
@@ -6997,6 +7034,38 @@ mod tests {
             1,
             false,
         ));
+    }
+
+    #[test]
+    fn test_exclude_reserved() {
+        const GIB: u64 = 1 << 30;
+        let hole = (1012 * GIB, 1024 * GIB);
+
+        // Inside the window, which is split around it.
+        assert_eq!(
+            exclude_reserved(4 * GIB..=2048 * GIB - 1, &[hole]),
+            [4 * GIB..=1012 * GIB - 1, 1024 * GIB..=2048 * GIB - 1]
+        );
+        // Straddling either end of the window.
+        assert_eq!(
+            exclude_reserved(4 * GIB..=1016 * GIB - 1, &[hole]),
+            vec![4 * GIB..=1012 * GIB - 1]
+        );
+        assert_eq!(
+            exclude_reserved(1016 * GIB..=2048 * GIB - 1, &[hole]),
+            vec![1024 * GIB..=2048 * GIB - 1]
+        );
+        // Clear of the window, or covering it entirely.
+        assert_eq!(
+            exclude_reserved(4 * GIB..=8 * GIB - 1, &[hole]),
+            vec![4 * GIB..=8 * GIB - 1]
+        );
+        assert!(exclude_reserved(1013 * GIB..=1014 * GIB - 1, &[hole]).is_empty());
+        // Several ranges, including one below the window.
+        assert_eq!(
+            exclude_reserved(4 * GIB..=2048 * GIB - 1, &[(3 * GIB, 5 * GIB), hole]),
+            [5 * GIB..=1012 * GIB - 1, 1024 * GIB..=2048 * GIB - 1]
+        );
     }
 
     #[test]

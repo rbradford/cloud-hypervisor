@@ -10,6 +10,7 @@
 //
 
 use std::array;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 
 use acpi_tables::{Aml, aml};
@@ -58,6 +59,8 @@ pub(crate) struct PciSegment {
 
     pub(crate) mem32_allocator: Arc<Mutex<AddressAllocator>>,
     pub(crate) mem64_allocator: Arc<Mutex<AddressAllocator>>,
+    // Parts of the 64-bit area clear of reserved ranges
+    mem64_ranges: Vec<RangeInclusive<u64>>,
 }
 
 impl PciSegment {
@@ -68,12 +71,14 @@ impl PciSegment {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u16,
         numa_node: u32,
         address_manager: &Arc<AddressManager>,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         state: Option<PciSegmentState>,
     ) -> DeviceManagerResult<PciSegment> {
@@ -123,6 +128,7 @@ impl PciSegment {
             end_of_mem32_area,
             start_of_mem64_area,
             end_of_mem64_area,
+            mem64_ranges,
             slots: array::from_fn(|device_id| PciDevSlot {
                 device_id: device_id as u8,
                 ejectable: true,
@@ -147,6 +153,7 @@ impl PciSegment {
         address_manager: &Arc<AddressManager>,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         pci_config_io_state: Option<PciConfigIoState>,
         state: Option<PciSegmentState>,
@@ -157,6 +164,7 @@ impl PciSegment {
             address_manager,
             mem32_allocator,
             mem64_allocator,
+            mem64_ranges,
             pci_irq_slots,
             state,
         )?;
@@ -184,6 +192,7 @@ impl PciSegment {
         address_manager: &Arc<AddressManager>,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         state: Option<PciSegmentState>,
     ) -> DeviceManagerResult<PciSegment> {
@@ -193,6 +202,7 @@ impl PciSegment {
             address_manager,
             mem32_allocator,
             mem64_allocator,
+            mem64_ranges,
             pci_irq_slots,
             state,
         )
@@ -267,6 +277,7 @@ impl PciSegment {
         numa_node: u32,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         device_reloc: &Arc<dyn DeviceRelocation>,
     ) -> DeviceManagerResult<Self> {
@@ -303,6 +314,7 @@ impl PciSegment {
             end_of_mem32_area,
             start_of_mem64_area,
             end_of_mem64_area,
+            mem64_ranges,
             slots: array::from_fn(|device_id| PciDevSlot {
                 device_id: device_id as u8,
                 ejectable: true,
@@ -521,13 +533,19 @@ impl Aml for PciSegment {
             self.end_of_mem32_area,
             None,
         );
-        let mem64 = aml::AddressSpace::new_memory(
-            aml::AddressSpaceCacheable::NotCacheable,
-            true,
-            self.start_of_mem64_area,
-            self.end_of_mem64_area,
-            None,
-        );
+        let mem64: Vec<_> = self
+            .mem64_ranges
+            .iter()
+            .map(|range| {
+                aml::AddressSpace::new_memory(
+                    aml::AddressSpaceCacheable::NotCacheable,
+                    true,
+                    *range.start(),
+                    *range.end(),
+                    None,
+                )
+            })
+            .collect();
         // The I/O window starts above the ports of the platform devices.
         #[cfg(target_arch = "x86_64")]
         let io_window = aml::AddressSpace::new_io(layout::PCI_IO_WINDOW_START, 0xffffu16, None);
@@ -539,7 +557,7 @@ impl Aml for PciSegment {
         }
         resources.push(&mmio_config);
         resources.push(&mem32);
-        resources.push(&mem64);
+        resources.extend(mem64.iter().map(|range| range as &dyn Aml));
         #[cfg(target_arch = "x86_64")]
         if self.id == 0 {
             resources.push(&io_window);
@@ -644,6 +662,10 @@ mod tests {
             0,
             allocator_1,
             allocator_2,
+            vec![RangeInclusive::new(
+                guest_addr,
+                guest_addr + guest_size as u64 - 1,
+            )],
             &arr,
             &mock_device_reloc,
         )
