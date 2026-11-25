@@ -21,7 +21,6 @@ use pci::{DeviceRelocation, PciBdf, PciBus, PciConfigMmio, PciRoot};
 use pci::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE, PciConfigIo, PciConfigIoState};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use vm_allocator::AddressAllocator;
 use vm_device::BusDeviceSync;
 
 use crate::device_manager::{AddressManager, DeviceManagerError, DeviceManagerResult};
@@ -68,13 +67,11 @@ impl PciSegment {
         }
     }
 
-    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u16,
         numa_node: u32,
         address_manager: &Arc<AddressManager>,
-        mem32_allocator: &Mutex<AddressAllocator>,
-        mem64_allocator: &Mutex<AddressAllocator>,
+        mem32_window: RangeInclusive<u64>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         state: Option<PciSegmentState>,
@@ -99,15 +96,11 @@ impl PciSegment {
             )
             .map_err(DeviceManagerError::BusError)?;
 
-        let (start_of_mem32_area, end_of_mem32_area) = {
-            let allocator = mem32_allocator.lock().unwrap();
-            (allocator.base().0, allocator.end().0)
+        let (start_of_mem32_area, end_of_mem32_area) = mem32_window.into_inner();
+        let (Some(first), Some(last)) = (mem64_ranges.first(), mem64_ranges.last()) else {
+            return Err(DeviceManagerError::PciSegmentMmioAperture(id));
         };
-
-        let (start_of_mem64_area, end_of_mem64_area) = {
-            let allocator = mem64_allocator.lock().unwrap();
-            (allocator.base().0, allocator.end().0)
-        };
+        let (start_of_mem64_area, end_of_mem64_area) = (*first.start(), *last.end());
 
         let segment = PciSegment {
             id,
@@ -146,8 +139,7 @@ impl PciSegment {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn new_default_segment(
         address_manager: &Arc<AddressManager>,
-        mem32_allocator: &Mutex<AddressAllocator>,
-        mem64_allocator: &Mutex<AddressAllocator>,
+        mem32_window: RangeInclusive<u64>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         pci_config_io_state: Option<PciConfigIoState>,
@@ -157,8 +149,7 @@ impl PciSegment {
             0,
             0,
             address_manager,
-            mem32_allocator,
-            mem64_allocator,
+            mem32_window,
             mem64_ranges,
             pci_irq_slots,
             state,
@@ -185,8 +176,7 @@ impl PciSegment {
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     pub(crate) fn new_default_segment(
         address_manager: &Arc<AddressManager>,
-        mem32_allocator: &Mutex<AddressAllocator>,
-        mem64_allocator: &Mutex<AddressAllocator>,
+        mem32_window: RangeInclusive<u64>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         state: Option<PciSegmentState>,
@@ -195,8 +185,7 @@ impl PciSegment {
             0,
             0,
             address_manager,
-            mem32_allocator,
-            mem64_allocator,
+            mem32_window,
             mem64_ranges,
             pci_irq_slots,
             state,
@@ -270,8 +259,7 @@ impl PciSegment {
     fn new_without_address_manager(
         id: u16,
         numa_node: u32,
-        mem32_allocator: &Mutex<AddressAllocator>,
-        mem64_allocator: &Mutex<AddressAllocator>,
+        mem32_window: RangeInclusive<u64>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         device_reloc: &Arc<dyn DeviceRelocation>,
@@ -283,15 +271,11 @@ impl PciSegment {
         let mmio_config_address =
             layout::PCI_MMCONFIG_START.0 + layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT * id as u64;
 
-        let (start_of_mem32_area, end_of_mem32_area) = {
-            let allocator = mem32_allocator.lock().unwrap();
-            (allocator.base().0, allocator.end().0)
+        let (start_of_mem32_area, end_of_mem32_area) = mem32_window.into_inner();
+        let (Some(first), Some(last)) = (mem64_ranges.first(), mem64_ranges.last()) else {
+            return Err(DeviceManagerError::PciSegmentMmioAperture(id));
         };
-
-        let (start_of_mem64_area, end_of_mem64_area) = {
-            let allocator = mem64_allocator.lock().unwrap();
-            (allocator.base().0, allocator.end().0)
-        };
+        let (start_of_mem64_area, end_of_mem64_area) = (*first.start(), *last.end());
 
         let segment = PciSegment {
             id,
@@ -596,8 +580,6 @@ mod tests {
     use std::io;
     use std::result::Result;
 
-    use vm_memory::GuestAddress;
-
     use super::*;
 
     #[derive(Debug)]
@@ -639,26 +621,14 @@ mod tests {
     }
 
     fn setup_segment(id: u16) -> PciSegment {
-        let guest_addr = 0_u64;
-        let guest_size = 0x1000_usize;
-        let allocator_1 = Arc::new(Mutex::new(
-            AddressAllocator::new(GuestAddress(guest_addr), guest_size as u64).unwrap(),
-        ));
-        let allocator_2 = Arc::new(Mutex::new(
-            AddressAllocator::new(GuestAddress(guest_addr), guest_size as u64).unwrap(),
-        ));
         let mock_device_reloc: Arc<dyn DeviceRelocation> = Arc::new(MockDeviceRelocation {});
         let arr = [0_u8; 32];
 
         PciSegment::new_without_address_manager(
             id,
             0,
-            &allocator_1,
-            &allocator_2,
-            vec![RangeInclusive::new(
-                guest_addr,
-                guest_addr + guest_size as u64 - 1,
-            )],
+            0..=0xfff,
+            vec![RangeInclusive::new(0, 0xfff)],
             &arr,
             &mock_device_reloc,
         )

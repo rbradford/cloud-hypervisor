@@ -122,8 +122,7 @@ use virtio_devices::{
 };
 use vm_allocator::page_size::get_page_size;
 use vm_allocator::{
-    AddressAllocator, GuestMemoryNotification, GuestRegionError, InterruptAllocError,
-    SystemAllocator,
+    GuestMemoryNotification, GuestRegionError, InterruptAllocError, SystemAllocator,
 };
 use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_device::interrupt::{
@@ -1121,37 +1120,21 @@ pub struct DeviceManager {
     ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
 }
 
-// Claims the part of [base, end) that falls inside the allocator.
-fn claim_reserved(
-    allocator: &mut AddressAllocator,
-    base: u64,
-    end: u64,
-) -> DeviceManagerResult<()> {
-    let start = base.max(allocator.base().0);
-    let last = (end - 1).min(allocator.end().0);
-    if start <= last {
-        allocator
-            .allocate(Some(GuestAddress(start)), last - start + 1, None)
-            .ok_or(DeviceManagerError::AllocateMmioAddress)?;
-    }
-    Ok(())
-}
-
-/// Create per-PCI-segment MMIO allocators over the range `[start, end]`.
-/// Both `start` and `end` are inclusive addresses.
-fn create_mmio_allocators(
+/// Split the range `[start, end]` into per PCI segment MMIO windows. Both
+/// `start` and `end` are inclusive addresses, as are the window bounds.
+fn create_mmio_windows(
     start: u64,
     end: u64,
     num_pci_segments: u16,
     weights: &[u32],
     alignment: u64,
-) -> DeviceManagerResult<Box<[Arc<Mutex<AddressAllocator>>]>> {
+) -> DeviceManagerResult<Vec<RangeInclusive<u64>>> {
     let total_weight: u32 = weights.iter().sum();
 
     // Start each PCI segment mmio range on an aligned boundary
     let pci_segment_mmio_size = (end - start + 1) / (alignment * total_weight as u64) * alignment;
 
-    let mut mmio_allocators = vec![];
+    let mut mmio_windows = vec![];
     let mut i = 0;
     for segment_id in 0..num_pci_segments as u64 {
         let weight = weights[segment_id as usize] as u64;
@@ -1165,15 +1148,16 @@ fn create_mmio_allocators(
         } else {
             pci_segment_mmio_size * weight
         };
-        let allocator = AddressAllocator::new(GuestAddress(mmio_start), mmio_size).ok_or(
-            DeviceManagerError::PciSegmentMmioAperture(segment_id as u16),
-        )?;
-        let allocator = Arc::new(Mutex::new(allocator));
-        mmio_allocators.push(allocator);
+        if mmio_size == 0 {
+            return Err(DeviceManagerError::PciSegmentMmioAperture(
+                segment_id as u16,
+            ));
+        }
+        mmio_windows.push(mmio_start..=mmio_start + mmio_size - 1);
         i += weight;
     }
 
-    Ok(mmio_allocators.into_boxed_slice())
+    Ok(mmio_windows)
 }
 
 /// Remove the reserved ranges, given as sorted `[base, end)` spans, from the
@@ -1263,7 +1247,7 @@ impl DeviceManager {
         let start_of_mmio32_area = layout::MEM_32BIT_DEVICES_START.0;
         let end_of_mmio32_area =
             layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1;
-        let pci_mmio32_allocators = create_mmio_allocators(
+        let pci_mmio32_windows = create_mmio_windows(
             start_of_mmio32_area,
             end_of_mmio32_area,
             num_pci_segments,
@@ -1284,7 +1268,7 @@ impl DeviceManager {
             let mm = memory_manager.lock().unwrap();
             (mm.start_of_device_area().0, mm.end_of_device_area().0)
         };
-        let pci_mmio64_allocators = create_mmio_allocators(
+        let pci_mmio64_windows = create_mmio_windows(
             start_of_mmio64_area,
             end_of_mmio64_area,
             num_pci_segments,
@@ -1292,20 +1276,7 @@ impl DeviceManager {
             4 << 30,
         )?;
 
-        // Keep BARs off reserved ranges.
         let reserved_regions = memory_manager.lock().unwrap().reserved_regions();
-        for &(base, end) in &reserved_regions {
-            for allocator in pci_mmio64_allocators.iter() {
-                claim_reserved(&mut allocator.lock().unwrap(), base, end)?;
-            }
-        }
-        let pci_mmio64_ranges: Vec<_> = pci_mmio64_allocators
-            .iter()
-            .map(|allocator| {
-                let allocator = allocator.lock().unwrap();
-                exclude_reserved(allocator.base().0..=allocator.end().0, &reserved_regions)
-            })
-            .collect();
 
         let address_manager = Arc::new(AddressManager {
             allocator: memory_manager.lock().unwrap().allocator(),
@@ -1342,9 +1313,8 @@ impl DeviceManager {
 
         let mut pci_segments = vec![PciSegment::new_default_segment(
             &address_manager,
-            &pci_mmio32_allocators[0],
-            &pci_mmio64_allocators[0],
-            pci_mmio64_ranges[0].clone(),
+            pci_mmio32_windows[0].clone(),
+            exclude_reserved(pci_mmio64_windows[0].clone(), &reserved_regions),
             &pci_irq_slots,
             #[cfg(target_arch = "x86_64")]
             state_from_id(snapshot, pci::PCI_CONFIG_IO_SNAPSHOT_ID)
@@ -1360,9 +1330,8 @@ impl DeviceManager {
                 i as u16,
                 numa_node_id_from_pci_segment_id(&numa_nodes, i as u16),
                 &address_manager,
-                &pci_mmio32_allocators[i],
-                &pci_mmio64_allocators[i],
-                pci_mmio64_ranges[i].clone(),
+                pci_mmio32_windows[i].clone(),
+                exclude_reserved(pci_mmio64_windows[i].clone(), &reserved_regions),
                 &pci_irq_slots,
                 state
                     .as_ref()
@@ -6923,16 +6892,13 @@ mod tests {
 
     #[test]
     fn restore_preserves_pci_hotplug_flags() {
-        let allocator =
-            Mutex::new(AddressAllocator::new(GuestAddress(0x1000_0000), 0x1000_0000).unwrap());
         let window = 0x1000_0000..=0x1fff_ffff;
         let address_manager = test_address_manager();
         let mut segment = PciSegment::new(
             1,
             0,
             &address_manager,
-            &allocator,
-            &allocator,
+            window.clone(),
             vec![window.clone()],
             &[0; 32],
             None,
@@ -6949,8 +6915,7 @@ mod tests {
 
         let restored = PciSegment::new_default_segment(
             &address_manager,
-            &allocator,
-            &allocator,
+            window.clone(),
             vec![window],
             &[0; 32],
             #[cfg(target_arch = "x86_64")]
@@ -6960,44 +6925,6 @@ mod tests {
         .unwrap();
         assert_eq!(restored.pci_devices_up, 1 << 2);
         assert_eq!(restored.pci_devices_down, 1 << 3);
-    }
-
-    #[test]
-    fn claim_reserved_keeps_bars_off_the_range() {
-        use vm_allocator::AddressAllocator;
-        use vm_memory::GuestAddress;
-
-        use super::claim_reserved;
-
-        const GIB: u64 = 1 << 30;
-        let (base, end) = (1012 * GIB, 1024 * GIB);
-
-        // Wholly inside the allocator.
-        let mut a = AddressAllocator::new(GuestAddress(8 * GIB), 2040 * GIB).unwrap();
-        claim_reserved(&mut a, base, end).unwrap();
-        assert!(a.allocate(Some(GuestAddress(base)), 4096, None).is_none());
-        assert!(
-            a.allocate(Some(GuestAddress(end - 4096)), 4096, None)
-                .is_none()
-        );
-        assert!(a.allocate(Some(GuestAddress(end)), 4096, None).is_some());
-
-        // Straddling the allocator end, only the overlap is claimed.
-        let mut a = AddressAllocator::new(GuestAddress(8 * GIB), 1008 * GIB).unwrap();
-        claim_reserved(&mut a, base, end).unwrap();
-        assert!(a.allocate(Some(GuestAddress(base)), 4096, None).is_none());
-        assert!(
-            a.allocate(Some(GuestAddress(base - 4096)), 4096, None)
-                .is_some()
-        );
-
-        // Clear of the allocator, nothing is claimed.
-        let mut a = AddressAllocator::new(GuestAddress(8 * GIB), 8 * GIB).unwrap();
-        claim_reserved(&mut a, base, end).unwrap();
-        assert!(
-            a.allocate(Some(GuestAddress(8 * GIB)), 8 * GIB, None)
-                .is_some()
-        );
     }
 
     use super::*;
@@ -7073,59 +7000,20 @@ mod tests {
     }
 
     #[test]
-    fn test_create_mmio_allocators() {
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 1, &[1], 4 << 10).unwrap();
+    fn test_create_mmio_windows() {
+        let res = create_mmio_windows(0x100000, 0x3fffff, 1, &[1], 4 << 10).unwrap();
         assert_eq!(res.len(), 1);
-        assert_eq!(
-            res[0].lock().unwrap().base(),
-            vm_memory::GuestAddress(0x100000)
-        );
-        assert_eq!(
-            res[0].lock().unwrap().end(),
-            vm_memory::GuestAddress(0x3fffff)
-        );
+        assert_eq!(res[0], 0x100000..=0x3fffff);
 
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[1, 1], 4 << 10).unwrap();
-        assert_eq!(res.len(), 2);
-        assert_eq!(
-            res[0].lock().unwrap().base(),
-            vm_memory::GuestAddress(0x100000)
-        );
-        assert_eq!(
-            res[0].lock().unwrap().end(),
-            vm_memory::GuestAddress(0x27ffff)
-        );
-        assert_eq!(
-            res[1].lock().unwrap().base(),
-            vm_memory::GuestAddress(0x280000)
-        );
-        assert_eq!(
-            res[1].lock().unwrap().end(),
-            vm_memory::GuestAddress(0x3fffff)
-        );
+        let res = create_mmio_windows(0x100000, 0x3fffff, 2, &[1, 1], 4 << 10).unwrap();
+        assert_eq!(res, [0x100000..=0x27ffff, 0x280000..=0x3fffff]);
 
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[2, 1], 4 << 10).unwrap();
-        assert_eq!(res.len(), 2);
-        assert_eq!(
-            res[0].lock().unwrap().base(),
-            vm_memory::GuestAddress(0x100000)
-        );
-        assert_eq!(
-            res[0].lock().unwrap().end(),
-            vm_memory::GuestAddress(0x2fffff)
-        );
-        assert_eq!(
-            res[1].lock().unwrap().base(),
-            vm_memory::GuestAddress(0x300000)
-        );
-        assert_eq!(
-            res[1].lock().unwrap().end(),
-            vm_memory::GuestAddress(0x3fffff)
-        );
+        let res = create_mmio_windows(0x100000, 0x3fffff, 2, &[2, 1], 4 << 10).unwrap();
+        assert_eq!(res, [0x100000..=0x2fffff, 0x300000..=0x3fffff]);
 
         // The 3 MiB aperture rounds down to 0 for each of 1024 segments.
         assert!(matches!(
-            create_mmio_allocators(0x100000, 0x3fffff, 1024, &[1; 1024], 4 << 10),
+            create_mmio_windows(0x100000, 0x3fffff, 1024, &[1; 1024], 4 << 10),
             Err(DeviceManagerError::PciSegmentMmioAperture(0))
         ));
     }
