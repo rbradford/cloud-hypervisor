@@ -404,6 +404,26 @@ impl VfioBarMemoryRegion {
         let region = self.region.lock().unwrap();
         p2p_mapping.lock().unwrap().unmap_p2p(&region)
     }
+
+    /// Move the region to `address`. A region that is not registered is
+    /// only registered again if `register` is set.
+    fn place(&mut self, address: u64, register: bool, map_p2p: bool) -> Result<(), VfioPciError> {
+        self.unmap_p2p().map_err(VfioPciError::DmaUnmap)?;
+        self.move_region(address)
+            .map_err(VfioPciError::MoveBarMemoryRegion)?;
+        if register {
+            let region = self.region.lock().unwrap();
+            if !region.is_registered() {
+                region
+                    .register()
+                    .map_err(VfioPciError::CreateUserMemoryRegion)?;
+            }
+        }
+        if map_p2p {
+            self.map_for_p2p()?;
+        }
+        Ok(())
+    }
 }
 
 impl VfioP2pMapping {
@@ -971,19 +991,7 @@ impl VfioCommon {
                 .collect::<Result<Vec<_>, VfioPciError>>()?;
             for (i, &(_, new_address, map_p2p)) in moves.iter().enumerate() {
                 let bar_memory_region = &mut region.bar_memory_regions[i];
-                let result = (|| {
-                    bar_memory_region
-                        .unmap_p2p()
-                        .map_err(VfioPciError::DmaUnmap)?;
-                    bar_memory_region
-                        .move_region(new_address)
-                        .map_err(VfioPciError::MoveBarMemoryRegion)?;
-                    if map_p2p {
-                        bar_memory_region.map_for_p2p()?;
-                    }
-                    Ok(())
-                })();
-                if let Err(e) = result {
+                if let Err(e) = bar_memory_region.place(new_address, false, map_p2p) {
                     for (bar_memory_region, &(old_address, _, was_mapped)) in region
                         .bar_memory_regions[..=i]
                         .iter_mut()
@@ -996,27 +1004,9 @@ impl VfioCommon {
                         {
                             continue;
                         }
-                        let rollback: Result<(), VfioPciError> = (|| {
-                            bar_memory_region
-                                .unmap_p2p()
-                                .map_err(VfioPciError::DmaUnmap)?;
-                            bar_memory_region
-                                .move_region(old_address)
-                                .map_err(VfioPciError::MoveBarMemoryRegion)?;
-                            {
-                                let mapping = bar_memory_region.region.lock().unwrap();
-                                if !mapping.is_registered() {
-                                    mapping
-                                        .register()
-                                        .map_err(VfioPciError::CreateUserMemoryRegion)?;
-                                }
-                            }
-                            if was_mapped {
-                                bar_memory_region.map_for_p2p()?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(rollback) = rollback {
+                        if let Err(rollback) =
+                            bar_memory_region.place(old_address, true, was_mapped)
+                        {
                             // Continuing would leave the BAR with inconsistent mappings.
                             error!("FATAL: Failed to restore BAR mapping: {rollback:?}");
                             process::exit(1);
