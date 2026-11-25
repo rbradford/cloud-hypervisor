@@ -48,6 +48,10 @@ Insmod an ivshmem device driver to enable the device. The file data will be
 mmapped to the PCI `bar2` of ivshmem device,
 guest can r/w data by accessing this memory.
 
+The shared memory is mapped once the guest enables memory decoding for the
+device. Without a driver, enable the device through sysfs before accessing
+`bar2`, for example with `echo 1 > /sys/bus/pci/devices/<bdf>/enable`.
+
 A simple example of ivshmem driver can be obtained from:
 https://github.com/lisongqian/clh-linux/commits/ch-6.12.8-ivshmem
 

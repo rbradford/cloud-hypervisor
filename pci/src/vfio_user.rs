@@ -13,10 +13,7 @@ use thiserror::Error;
 use vfio_bindings::bindings::vfio::*;
 use vfio_ioctls::VfioIrq;
 use vfio_user::{Client, Error as VfioUserError};
-use vm_allocator::{
-    AddressAllocator, GuestMemoryNotification, GuestRegion, GuestRegionError, MemorySlotAllocator,
-    SystemAllocator,
-};
+use vm_allocator::{GuestMemoryNotification, GuestRegion, GuestRegionError, MemorySlotAllocator};
 use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_device::interrupt::{InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig};
 use vm_device::{BusDevice, Resource};
@@ -331,27 +328,9 @@ impl Vfio for VfioUserClientWrapper {
 impl PciDevice for VfioUserPciDevice {
     fn allocate_bars(
         &mut self,
-        allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,
     ) -> Result<Vec<PciBarConfiguration>, PciDeviceError> {
-        self.common.allocate_bars(
-            allocator,
-            mmio32_allocator,
-            mmio64_allocator,
-            resources.as_deref(),
-        )
-    }
-
-    fn free_bars(
-        &mut self,
-        allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
-    ) -> Result<(), PciDeviceError> {
-        self.common
-            .free_bars(allocator, mmio32_allocator, mmio64_allocator)
+        self.common.allocate_bars(resources.as_deref())
     }
 
     fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {

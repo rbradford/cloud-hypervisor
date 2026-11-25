@@ -38,10 +38,7 @@ use vm_allocator::page_size::{
     align_page_size_down, align_page_size_up, get_page_size, is_4k_aligned, is_4k_multiple,
     is_page_size_aligned,
 };
-use vm_allocator::{
-    AddressAllocator, GuestMemory, GuestRegion, GuestRegionError, MemorySlotAllocator,
-    SystemAllocator,
-};
+use vm_allocator::{GuestMemory, GuestRegion, GuestRegionError, MemorySlotAllocator};
 use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig,
@@ -510,7 +507,6 @@ impl VfioP2pMapping {
 pub struct VfioBar {
     pub start: GuestAddress,
     pub length: GuestUsize,
-    pub(crate) type_: PciBarRegionType,
     pub(crate) index: u32,
     pub(crate) bar_memory_regions: Vec<VfioBarMemoryRegion>,
 }
@@ -1193,18 +1189,14 @@ impl VfioCommon {
 
     pub(crate) fn allocate_bars(
         &mut self,
-        allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
         resources: Option<&[Resource]>,
     ) -> Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
         let mut bar_id = VFIO_PCI_BAR0_REGION_INDEX;
 
         // Going through all regular regions to compute the BAR size.
-        // We're not saving the BAR address to restore it, because we
-        // are going to allocate a guest address for each BAR and write
-        // that new address back.
+        // We're not saving the BAR address to restore it, because the
+        // BARs start unassigned for the guest to place them.
         while bar_id < VFIO_PCI_CONFIG_REGION_INDEX {
             let mut region_size: u64 = 0;
             let mut region_type = PciBarRegionType::Memory32BitRegion;
@@ -1328,36 +1320,13 @@ impl VfioCommon {
                 }
             }
 
-            let bar_addr = match region_type {
-                PciBarRegionType::IoRegion => {
-                    let alignment = if restored_bar_addr.is_some() {
-                        Some(4)
-                    } else {
-                        Some(region_size.max(4))
-                    };
-                    allocator
-                        .allocate_io_addresses(restored_bar_addr, region_size, alignment)
-                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
-                }
-                PciBarRegionType::Memory32BitRegion => {
-                    // BAR allocation must be naturally aligned
-                    mmio32_allocator
-                        .allocate(restored_bar_addr, region_size, Some(region_size))
-                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
-                }
-                PciBarRegionType::Memory64BitRegion => {
-                    // We need do some fixup to keep MMIO RW region and msix cap region page size
-                    // aligned.
-                    region_size = self.fixup_msix_region(bar_id, region_size);
-                    mmio64_allocator
-                        .allocate(
-                            restored_bar_addr,
-                            region_size,
-                            Some(cmp::max(get_page_size(), region_size)),
-                        )
-                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
-                }
-            };
+            if region_type == PciBarRegionType::Memory64BitRegion {
+                // We need do some fixup to keep MMIO RW region and msix cap region page size
+                // aligned.
+                region_size = self.fixup_msix_region(bar_id, region_size);
+            }
+            // A new BAR is unassigned, for the guest to place.
+            let bar_addr = restored_bar_addr.unwrap_or_default();
 
             // We can now build our BAR configuration block.
             let bar = PciBarConfiguration::default()
@@ -1386,7 +1355,6 @@ impl VfioCommon {
             self.bars.push(VfioBar {
                 start: bar_addr,
                 length: region_size,
-                type_: region_type,
                 index: bar_id,
                 bar_memory_regions: Vec::new(),
             });
@@ -1397,28 +1365,6 @@ impl VfioCommon {
             }
         }
         Ok(bars)
-    }
-
-    pub(crate) fn free_bars(
-        &mut self,
-        allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
-    ) -> Result<(), PciDeviceError> {
-        for region in self.bars.iter() {
-            match region.type_ {
-                PciBarRegionType::IoRegion => {
-                    allocator.free_io_addresses(region.start, region.length);
-                }
-                PciBarRegionType::Memory32BitRegion => {
-                    mmio32_allocator.free(region.start, region.length);
-                }
-                PciBarRegionType::Memory64BitRegion => {
-                    mmio64_allocator.free(region.start, region.length);
-                }
-            }
-        }
-        Ok(())
     }
 
     fn parse_msix_capabilities(&mut self, cap: u8) -> MsixCap {
@@ -3116,27 +3062,9 @@ const NVIDIA_BAR0_CONFIG_MIRROR_SIZE: u64 = 0x1000;
 impl PciDevice for VfioPciDevice {
     fn allocate_bars(
         &mut self,
-        allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,
     ) -> Result<Vec<PciBarConfiguration>, PciDeviceError> {
-        self.common.allocate_bars(
-            allocator,
-            mmio32_allocator,
-            mmio64_allocator,
-            resources.as_deref(),
-        )
-    }
-
-    fn free_bars(
-        &mut self,
-        allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
-    ) -> Result<(), PciDeviceError> {
-        self.common
-            .free_bars(allocator, mmio32_allocator, mmio64_allocator)
+        self.common.allocate_bars(resources.as_deref())
     }
 
     fn write_config_register(
@@ -3540,7 +3468,6 @@ mod tests {
         common.bars.push(VfioBar {
             start: GuestAddress(0),
             length: 4 * page_size,
-            type_: PciBarRegionType::Memory32BitRegion,
             index: 0,
             bar_memory_regions: regions,
         });
@@ -3613,7 +3540,6 @@ mod tests {
         common.bars.push(VfioBar {
             start: GuestAddress(page_size),
             length: 3 * page_size,
-            type_: PciBarRegionType::Memory32BitRegion,
             index: 0,
             bar_memory_regions: regions,
         });
@@ -3673,7 +3599,6 @@ mod tests {
         vec![VfioBar {
             start: GuestAddress(page_size),
             length: 4 * page_size,
-            type_: PciBarRegionType::Memory32BitRegion,
             index: 0,
             bar_memory_regions: vec![
                 VfioBarMemoryRegion {
@@ -4061,7 +3986,6 @@ mod tests {
         common.bars.push(VfioBar {
             start: GuestAddress(0),
             length: 0x10000,
-            type_: PciBarRegionType::Memory32BitRegion,
             index: 0,
             bar_memory_regions: Vec::new(),
         });
@@ -4811,7 +4735,6 @@ mod tests {
         common.bars.push(VfioBar {
             start: GuestAddress(bar0_gpa),
             length: bar0_size,
-            type_: PciBarRegionType::Memory32BitRegion,
             index: VFIO_PCI_BAR0_REGION_INDEX,
             bar_memory_regions: Vec::new(),
         });
@@ -4880,7 +4803,6 @@ mod tests {
         common.bars.push(VfioBar {
             start: GuestAddress(bar0_gpa),
             length: bar0_size,
-            type_: PciBarRegionType::Memory32BitRegion,
             index: VFIO_PCI_BAR0_REGION_INDEX,
             bar_memory_regions: Vec::new(),
         });

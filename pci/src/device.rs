@@ -10,7 +10,6 @@ use std::{io, result};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::Resource;
 
 use crate::configuration::{self, PciBarRegionType};
@@ -21,9 +20,6 @@ pub enum Error {
     /// Setup of the device capabilities failed.
     #[error("Setup of the device capabilities failed")]
     CapabilitiesSetup(#[source] configuration::Error),
-    /// Allocating space for an IO BAR failed.
-    #[error("Allocating space for an IO BAR of size {0} failed")]
-    IoAllocationFailed(u64),
     /// Registering an IO BAR failed.
     #[error("Registering an IO BAR at address {0:#x} failed")]
     IoRegistrationFailed(u64, #[source] configuration::Error),
@@ -50,26 +46,14 @@ pub struct BarReprogrammingParams {
 }
 
 pub trait PciDevice: Send {
-    /// Allocates the needed PCI BARs space using the `allocate` function which takes a size and
-    /// returns an address. Returns a Vec of (GuestAddress, GuestUsize) tuples.
+    /// Adds the device BARs to its configuration space and returns them. The
+    /// BARs of a new device are unassigned, at address zero, for the guest
+    /// firmware or OS to assign. `resources` restores saved BAR addresses.
     fn allocate_bars(
         &mut self,
-        _allocator: &mut SystemAllocator,
-        _mmio32_allocator: &mut AddressAllocator,
-        _mmio64_allocator: &mut AddressAllocator,
         _resources: Option<Vec<Resource>>,
     ) -> Result<Vec<PciBarConfiguration>> {
         Ok(Vec::new())
-    }
-
-    /// Frees the PCI BARs previously allocated with a call to allocate_bars().
-    fn free_bars(
-        &mut self,
-        _allocator: &mut SystemAllocator,
-        _mmio32_allocator: &mut AddressAllocator,
-        _mmio64_allocator: &mut AddressAllocator,
-    ) -> Result<()> {
-        Ok(())
     }
 
     /// Sets a register in the configuration space.
@@ -123,6 +107,7 @@ pub trait PciDevice: Send {
 pub trait DeviceRelocation: Send + Sync {
     /// The BAR needs to be moved to a different location in the guest address
     /// space. This follows a decision from the software running in the guest.
+    /// A base of zero means the BAR is unassigned and must not be mapped.
     fn move_bar(
         &self,
         bar_idx: usize,

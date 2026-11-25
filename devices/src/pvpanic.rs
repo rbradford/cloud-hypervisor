@@ -4,8 +4,8 @@
 //
 
 use std::any::Any;
+use std::result;
 use std::sync::{Arc, Barrier};
-use std::{io, result};
 
 use event_monitor::event;
 use log::{debug, info};
@@ -16,9 +16,7 @@ use pci::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::{BusDevice, Resource};
-use vm_memory::{Address, GuestAddress};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
 const PVPANIC_VENDOR_ID: u16 = 0x1b36;
@@ -28,7 +26,6 @@ const PVPANIC_SUBSYSTEM_ID: u16 = 0x1100;
 
 const PCI_BAR_REGION_SIZE_MIN: u64 = 0x10;
 pub const PVPANIC_DEVICE_MMIO_SIZE: u64 = 0x2;
-pub const PVPANIC_DEVICE_MMIO_ALIGNMENT: u64 = 0x10;
 
 const PVPANIC_PANICKED: u8 = 1 << 0;
 const PVPANIC_CRASH_LOADED: u8 = 1 << 1;
@@ -60,7 +57,6 @@ pub struct PvPanicDevice {
 
     // PCI configuration registers.
     configuration: PciConfiguration,
-    bar_regions: Vec<PciBarConfiguration>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,7 +99,6 @@ impl PvPanicDevice {
             bdf,
             events,
             configuration,
-            bar_regions: vec![],
         };
 
         Ok(pvpanic_device)
@@ -163,9 +158,6 @@ impl PciDevice for PvPanicDevice {
 
     fn allocate_bars(
         &mut self,
-        _allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        _mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,
     ) -> result::Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
@@ -182,7 +174,7 @@ impl PciDevice for PvPanicDevice {
                 } = resource
                     && index == bar_id as usize
                 {
-                    bar_addr = Some(GuestAddress(base));
+                    bar_addr = Some(base);
                     region_size = size;
                     break;
                 }
@@ -192,51 +184,25 @@ impl PciDevice for PvPanicDevice {
             }
         }
 
-        let bar_addr = mmio32_allocator
-            .allocate(bar_addr, region_size, Some(PVPANIC_DEVICE_MMIO_ALIGNMENT))
-            .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
-
+        // A new BAR is unassigned, for the guest to place.
+        let bar_addr = bar_addr.unwrap_or_default();
         let bar = PciBarConfiguration::default()
             .set_index(bar_id as usize)
-            .set_address(bar_addr.raw_value())
+            .set_address(bar_addr)
             .set_size(region_size)
             .set_region_type(region_type)
             .set_prefetchable(PciBarPrefetchable::NotPrefetchable);
 
-        debug!("pvpanic bar address 0x{:x}", bar_addr.0);
+        debug!("pvpanic bar address 0x{bar_addr:x}");
         if !restoring {
             self.configuration
                 .add_pci_bar(&bar)
-                .map_err(|e| PciDeviceError::IoRegistrationFailed(bar_addr.raw_value(), e))?;
+                .map_err(|e| PciDeviceError::IoRegistrationFailed(bar_addr, e))?;
         }
 
         bars.push(bar);
-        self.bar_regions.clone_from(&bars);
 
         Ok(bars)
-    }
-
-    fn free_bars(
-        &mut self,
-        _allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        _mmio64_allocator: &mut AddressAllocator,
-    ) -> result::Result<(), PciDeviceError> {
-        for bar in self.bar_regions.drain(..) {
-            mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
-        }
-
-        Ok(())
-    }
-
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
-        for bar in self.bar_regions.iter_mut() {
-            if bar.idx() == bar_idx {
-                *bar = bar.set_address(new_base);
-            }
-        }
-
-        Ok(())
     }
 
     fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {

@@ -133,7 +133,7 @@ use vm_device::{Bus, BusDevice, BusDeviceSync, Resource};
 #[cfg(target_arch = "x86_64")]
 use vm_memory::GuestMemoryBackend;
 use vm_memory::guest_memory::FileOffset;
-use vm_memory::{Address, GuestAddress, GuestMemoryRegion, GuestUsize, MmapRegion, mmap};
+use vm_memory::{Address, GuestAddress, GuestMemoryRegion, MmapRegion, mmap};
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
@@ -319,13 +319,9 @@ pub enum DeviceManagerError {
     #[error("Cannot allocate IRQ")]
     AllocateIrq(#[from] InterruptAllocError),
 
-    /// Cannot allocate PCI BARs
-    #[error("Cannot allocate PCI BARs")]
+    /// Cannot add PCI BARs
+    #[error("Cannot add PCI BARs")]
     AllocateBars(#[source] pci::PciDeviceError),
-
-    /// Could not free the BARs associated with a PCI device.
-    #[error("Could not free the BARs associated with a PCI device")]
-    FreePciBars(#[source] pci::PciDeviceError),
 
     /// Cannot register ioevent.
     #[error("Cannot register ioevent")]
@@ -358,10 +354,6 @@ pub enum DeviceManagerError {
     /// Cannot set persistent memory file size
     #[error("Cannot set persistent memory file size")]
     PmemFileSetLen(#[source] io::Error),
-
-    /// Cannot find a memory range for persistent memory
-    #[error("Cannot find a memory range for persistent memory")]
-    PmemRangeAllocation,
 
     /// Cannot create iommufd
     #[cfg(feature = "kvm")]
@@ -689,8 +681,9 @@ pub(crate) struct AddressManager {
     pub(crate) mmio_bus: Arc<Bus>,
     pub(crate) vm: Arc<dyn hypervisor::Vm>,
     device_tree: Arc<Mutex<DeviceTree>>,
-    pci_mmio32_allocators: Box<[Arc<Mutex<AddressAllocator>>]>,
-    pci_mmio64_allocators: Box<[Arc<Mutex<AddressAllocator>>]>,
+    // Bus devices of the PCI devices by BDF, to map a BAR once the guest
+    // assigns it an address.
+    pci_bus_devices: Mutex<HashMap<u32, Weak<dyn BusDeviceSync>>>,
 }
 
 impl AddressManager {
@@ -729,56 +722,35 @@ impl AddressManager {
         Ok(())
     }
 
-    fn update_io_range(
-        &self,
-        allocator: &mut SystemAllocator,
-        old_base: u64,
-        new_base: u64,
-        len: u64,
-    ) -> result::Result<(), io::Error> {
-        if allocator
-            .move_io_addresses(
-                GuestAddress(old_base),
-                GuestAddress(new_base),
-                len as GuestUsize,
-                Some(len.max(4)),
-            )
-            .is_none()
-        {
-            return Err(io::Error::other(format!(
-                "Cannot move IO BAR address range from {old_base:#x} to {new_base:#x}"
-            )));
-        }
-
-        self.io_bus
-            .update_range(old_base, len, new_base, len)
-            .map_err(io::Error::other)
+    fn pci_bus_device(&self, bdf: PciBdf) -> result::Result<Arc<dyn BusDeviceSync>, io::Error> {
+        self.pci_bus_devices
+            .lock()
+            .unwrap()
+            .get(&u32::from(bdf))
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| io::Error::other(format!("Couldn't find bus device for {bdf}")))
     }
 
-    fn update_mmio_range(
+    // An unassigned BAR, at address zero, has no bus range.
+    fn update_bus_range(
         &self,
-        allocator: &mut AddressAllocator,
+        bus: &Bus,
+        bdf: PciBdf,
         old_base: u64,
         new_base: u64,
         len: u64,
     ) -> result::Result<(), io::Error> {
-        if allocator
-            .move_range(
-                GuestAddress(old_base),
-                GuestAddress(new_base),
-                len as GuestUsize,
-                Some(len),
-            )
-            .is_none()
-        {
-            return Err(io::Error::other(format!(
-                "Cannot move MMIO BAR address range from {old_base:#x} to {new_base:#x}"
-            )));
+        match (old_base, new_base) {
+            (0, 0) => Ok(()),
+            (0, _) => bus.insert(self.pci_bus_device(bdf)?, new_base, len),
+            (_, 0) => bus.remove(old_base, len),
+            _ => bus.update_range(old_base, len, new_base, len),
         }
-
-        self.mmio_bus
-            .update_range(old_base, len, new_base, len)
-            .map_err(io::Error::other)
+        .map_err(|e| {
+            io::Error::other(format!(
+                "Cannot move BAR address range from {old_base:#x} to {new_base:#x}: {e}"
+            ))
+        })
     }
 
     fn update_device(
@@ -827,31 +799,24 @@ impl DeviceRelocation for AddressManager {
         pci_dev: &mut dyn PciDevice,
         region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
-        // Keep the allocator locked until the BAR has fully moved, so a
-        // concurrent allocation (e.g. a hotplug) cannot get the old range
-        // while the device still uses it.
-        let mut sys_allocator;
-        let mut pci_mmio_allocator;
+        // The guest assigns the BAR addresses. The bus rejects a BAR that
+        // overlaps another device.
+        let bus = if region_type == PciBarRegionType::IoRegion {
+            &self.io_bus
+        } else {
+            &self.mmio_bus
+        };
+        let bdf = pci_dev.bdf();
 
-        match region_type {
-            PciBarRegionType::IoRegion => {
-                sys_allocator = self.allocator.lock().unwrap();
-                self.update_io_range(&mut sys_allocator, old_base, new_base, len)?;
+        self.update_bus_range(bus, bdf, old_base, new_base, len)?;
+
+        if let Err(e) = self.update_device(pci_dev, bar_idx, old_base, new_base) {
+            // Keep the bus consistent with the restored BAR address.
+            if let Err(e) = self.update_bus_range(bus, bdf, new_base, old_base, len) {
+                error!("Failed restoring BAR address range: {e}");
             }
-            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
-                let pci_mmio_allocators = if region_type == PciBarRegionType::Memory32BitRegion {
-                    &self.pci_mmio32_allocators
-                } else {
-                    &self.pci_mmio64_allocators
-                };
-                pci_mmio_allocator = pci_mmio_allocators[usize::from(pci_dev.bdf().segment())]
-                    .lock()
-                    .unwrap();
-                self.update_mmio_range(&mut pci_mmio_allocator, old_base, new_base, len)?;
-            }
+            return Err(e);
         }
-
-        self.update_device(pci_dev, bar_idx, old_base, new_base)?;
 
         self.update_device_tree(pci_dev, bar_idx, new_base)
     }
@@ -1348,8 +1313,7 @@ impl DeviceManager {
             mmio_bus,
             vm: Arc::clone(&vm),
             device_tree: Arc::clone(&device_tree),
-            pci_mmio32_allocators,
-            pci_mmio64_allocators,
+            pci_bus_devices: Mutex::new(HashMap::new()),
         });
 
         // First we create the MSI interrupt manager, the legacy one is created
@@ -1378,8 +1342,8 @@ impl DeviceManager {
 
         let mut pci_segments = vec![PciSegment::new_default_segment(
             &address_manager,
-            Arc::clone(&address_manager.pci_mmio32_allocators[0]),
-            Arc::clone(&address_manager.pci_mmio64_allocators[0]),
+            &pci_mmio32_allocators[0],
+            &pci_mmio64_allocators[0],
             pci_mmio64_ranges[0].clone(),
             &pci_irq_slots,
             #[cfg(target_arch = "x86_64")]
@@ -1396,8 +1360,8 @@ impl DeviceManager {
                 i as u16,
                 numa_node_id_from_pci_segment_id(&numa_nodes, i as u16),
                 &address_manager,
-                Arc::clone(&address_manager.pci_mmio32_allocators[i]),
-                Arc::clone(&address_manager.pci_mmio64_allocators[i]),
+                &pci_mmio32_allocators[i],
+                &pci_mmio64_allocators[i],
                 pci_mmio64_ranges[i].clone(),
                 &pci_irq_slots,
                 state
@@ -3706,13 +3670,6 @@ impl DeviceManager {
         )
         .map_err(DeviceManagerError::RegisterGuestRegion)?;
         if let Some(base) = legacy_base {
-            // Keep the BARs the VMM allocates off the memory.
-            self.pci_segments[pmem_cfg.pci_common.pci_segment as usize]
-                .mem64_allocator
-                .lock()
-                .unwrap()
-                .allocate(Some(GuestAddress(base)), size, None)
-                .ok_or(DeviceManagerError::PmemRangeAllocation)?;
             mapping
                 .register()
                 .map_err(DeviceManagerError::RegisterGuestRegion)?;
@@ -3936,7 +3893,6 @@ impl DeviceManager {
 
         let (bars, new_resources) = self.allocate_pci_bars(
             Arc::clone(&pvmemcontrol_pci_device) as Arc<Mutex<dyn PciDevice>>,
-            pci_segment_id,
             resources,
         )?;
 
@@ -4741,7 +4697,6 @@ impl DeviceManager {
 
         let (bars, new_resources) = self.allocate_pci_bars(
             Arc::clone(&vfio_pci_device) as Arc<Mutex<dyn PciDevice>>,
-            pci_segment_id,
             resources,
         )?;
 
@@ -4790,24 +4745,12 @@ impl DeviceManager {
     fn allocate_pci_bars(
         &mut self,
         pci_device: Arc<Mutex<dyn PciDevice>>,
-        segment_id: u16,
         resources: Option<Vec<Resource>>,
     ) -> DeviceManagerResult<(Vec<PciBarConfiguration>, Vec<Resource>)> {
         let bars = pci_device
             .lock()
             .unwrap()
-            .allocate_bars(
-                &mut self.address_manager.allocator.lock().unwrap(),
-                &mut self.pci_segments[segment_id as usize]
-                    .mem32_allocator
-                    .lock()
-                    .unwrap(),
-                &mut self.pci_segments[segment_id as usize]
-                    .mem64_allocator
-                    .lock()
-                    .unwrap(),
-                resources,
-            )
+            .allocate_bars(resources)
             .map_err(DeviceManagerError::AllocateBars)?;
 
         let mut new_resources = Vec::new();
@@ -4834,6 +4777,11 @@ impl DeviceManager {
         bars: Vec<PciBarConfiguration>,
     ) -> DeviceManagerResult<()> {
         self.bus_devices.push(Arc::clone(&bus_device));
+        self.address_manager
+            .pci_bus_devices
+            .lock()
+            .unwrap()
+            .insert(u32::from(bdf), Arc::downgrade(&bus_device));
 
         self.register_bar_mapping(bus_device, &bars)?;
 
@@ -4853,7 +4801,8 @@ impl DeviceManager {
         bus_device: Arc<dyn BusDeviceSync>,
         bars: &[PciBarConfiguration],
     ) -> DeviceManagerResult<()> {
-        for bar in bars {
+        // An unassigned BAR is mapped once the guest assigns it.
+        for bar in bars.iter().filter(|bar| bar.addr() != 0) {
             match bar.region_type() {
                 PciBarRegionType::IoRegion => {
                     self.address_manager
@@ -4991,7 +4940,6 @@ impl DeviceManager {
 
         let (bars, new_resources) = self.allocate_pci_bars(
             Arc::clone(&vfio_user_pci_device) as Arc<Mutex<dyn PciDevice>>,
-            pci_segment_id,
             resources,
         )?;
 
@@ -5167,7 +5115,6 @@ impl DeviceManager {
 
         let (bars, new_resources) = self.allocate_pci_bars(
             Arc::clone(&virtio_pci_device) as Arc<Mutex<dyn PciDevice>>,
-            pci_segment_id,
             resources,
         )?;
 
@@ -5227,7 +5174,6 @@ impl DeviceManager {
 
         let (bars, new_resources) = self.allocate_pci_bars(
             Arc::clone(&pvpanic_device) as Arc<Mutex<dyn PciDevice>>,
-            pci_segment_id,
             resources,
         )?;
 
@@ -5284,7 +5230,6 @@ impl DeviceManager {
         ));
         let (bars, new_resources) = self.allocate_pci_bars(
             Arc::clone(&ivshmem_device) as Arc<Mutex<dyn PciDevice>>,
-            pci_segment_id,
             resources,
         )?;
 
@@ -5776,23 +5721,6 @@ impl DeviceManager {
                 }
             }
 
-            // Free the allocated BARs
-            pci_device
-                .lock()
-                .unwrap()
-                .free_bars(
-                    &mut self.address_manager.allocator.lock().unwrap(),
-                    &mut self.pci_segments[pci_segment_id as usize]
-                        .mem32_allocator
-                        .lock()
-                        .unwrap(),
-                    &mut self.pci_segments[pci_segment_id as usize]
-                        .mem64_allocator
-                        .lock()
-                        .unwrap(),
-                )
-                .map_err(DeviceManagerError::FreePciBars)?;
-
             // Remove the device from the PCI bus
             self.pci_segments[pci_segment_id as usize]
                 .pci_bus
@@ -5816,6 +5744,11 @@ impl DeviceManager {
             // DeviceManager.
             self.bus_devices
                 .retain(|dev| !Arc::ptr_eq(dev, &bus_device));
+            self.address_manager
+                .pci_bus_devices
+                .lock()
+                .unwrap()
+                .remove(&u32::from(pci_device_bdf));
 
             // Shutdown and remove the underlying virtio-device if present
             if let Some(virtio_device) = virtio_device {
@@ -6862,12 +6795,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restore_preserves_pci_hotplug_flags() {
-        let allocator = Arc::new(Mutex::new(
-            AddressAllocator::new(GuestAddress(0x1000_0000), 0x1000_0000).unwrap(),
-        ));
-        let address_manager = Arc::new(AddressManager {
+    fn test_address_manager() -> Arc<AddressManager> {
+        Arc::new(AddressManager {
             allocator: Arc::new(Mutex::new(
                 SystemAllocator::new(
                     GuestAddress(0),
@@ -6888,16 +6817,123 @@ mod tests {
                 .create_vm(hypervisor::HypervisorVmConfig::default())
                 .unwrap(),
             device_tree: Arc::new(Mutex::new(DeviceTree::new())),
-            pci_mmio32_allocators: Box::new([]),
-            pci_mmio64_allocators: Box::new([]),
-        });
+            pci_bus_devices: Mutex::new(HashMap::new()),
+        })
+    }
+
+    use std::any::Any;
+    use std::sync::Barrier;
+
+    struct TestPciDevice {
+        bdf: PciBdf,
+        refuse_moves: bool,
+    }
+
+    impl BusDevice for TestPciDevice {}
+
+    impl PciDevice for TestPciDevice {
+        fn allocate_bars(
+            &mut self,
+            _resources: Option<Vec<Resource>>,
+        ) -> result::Result<Vec<PciBarConfiguration>, pci::PciDeviceError> {
+            Ok(Vec::new())
+        }
+
+        fn write_config_register(
+            &mut self,
+            _reg_idx: usize,
+            _offset: u64,
+            _data: &[u8],
+        ) -> (Vec<pci::BarReprogrammingParams>, Option<Arc<Barrier>>) {
+            (Vec::new(), None)
+        }
+
+        fn read_config_register(&mut self, _reg_idx: usize) -> u32 {
+            0
+        }
+
+        fn move_bar(&mut self, _bar_idx: usize, _new_base: u64) -> result::Result<(), io::Error> {
+            if self.refuse_moves {
+                return Err(io::Error::other("move refused"));
+            }
+            Ok(())
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+
+        fn id(&self) -> Option<String> {
+            None
+        }
+
+        fn bdf(&self) -> PciBdf {
+            self.bdf
+        }
+    }
+
+    #[test]
+    fn move_bar_maps_only_assigned_bars() {
+        let address_manager = test_address_manager();
+        let bdf = PciBdf::new(0, 0, 1, 0);
+        let device = Arc::new(Mutex::new(TestPciDevice {
+            bdf,
+            refuse_moves: false,
+        }));
+        let bus_device: Arc<dyn BusDeviceSync> = Arc::clone(&device) as _;
+        address_manager
+            .pci_bus_devices
+            .lock()
+            .unwrap()
+            .insert(u32::from(bdf), Arc::downgrade(&bus_device));
+        let mapped = |address| address_manager.mmio_bus.read(address, &mut [0]).is_ok();
+        let move_bar = |old_base, new_base, refuse_moves| {
+            let mut device = device.lock().unwrap();
+            device.refuse_moves = refuse_moves;
+            address_manager.move_bar(
+                0,
+                old_base,
+                new_base,
+                0x1000,
+                &mut *device,
+                PciBarRegionType::Memory32BitRegion,
+            )
+        };
+
+        // Assigning the BAR adds its range to the bus, and moving it moves
+        // the range.
+        move_bar(0, 0x1000_0000, false).unwrap();
+        assert!(mapped(0x1000_0000));
+        move_bar(0x1000_0000, 0x1000_2000, false).unwrap();
+        assert!(!mapped(0x1000_0000));
+        assert!(mapped(0x1000_2000));
+
+        // A move the device refuses leaves the range where it was.
+        move_bar(0x1000_2000, 0x1000_4000, true).unwrap_err();
+        assert!(mapped(0x1000_2000));
+        assert!(!mapped(0x1000_4000));
+
+        // Unassigning the BAR removes its range, and an assignment the
+        // device refuses adds none.
+        move_bar(0x1000_2000, 0, false).unwrap();
+        assert!(!mapped(0x1000_2000));
+        move_bar(0, 0x1000_4000, true).unwrap_err();
+        assert!(!mapped(0x1000_4000));
+    }
+
+    #[test]
+    fn restore_preserves_pci_hotplug_flags() {
+        let allocator =
+            Mutex::new(AddressAllocator::new(GuestAddress(0x1000_0000), 0x1000_0000).unwrap());
+        let window = 0x1000_0000..=0x1fff_ffff;
+        let address_manager = test_address_manager();
         let mut segment = PciSegment::new(
             1,
             0,
             &address_manager,
-            Arc::clone(&allocator),
-            Arc::clone(&allocator),
-            vec![RangeInclusive::new(0x1000_0000, 0x1fff_ffff)],
+            &allocator,
+            &allocator,
+            vec![window.clone()],
             &[0; 32],
             None,
         )
@@ -6913,9 +6949,9 @@ mod tests {
 
         let restored = PciSegment::new_default_segment(
             &address_manager,
-            Arc::clone(&allocator),
-            allocator,
-            vec![RangeInclusive::new(0x1000_0000, 0x1fff_ffff)],
+            &allocator,
+            &allocator,
+            vec![window],
             &[0; 32],
             #[cfg(target_arch = "x86_64")]
             None,

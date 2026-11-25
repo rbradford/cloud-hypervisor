@@ -1561,6 +1561,12 @@ EOF
             .as_str(),
         )
         .unwrap();
+    // The shared memory is mapped once the device decodes memory.
+    guest
+        .ssh_command(&format!(
+            "echo 1 | sudo tee /sys/bus/pci/devices/{device_id}/enable"
+        ))
+        .unwrap();
     let guest_message = guest.ssh_command("sudo python3 test_read.py").unwrap();
 
     // Check the probe message in host and guest

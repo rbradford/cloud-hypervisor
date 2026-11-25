@@ -16,12 +16,12 @@ use pci::{
     PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciSubclass,
 };
 use thiserror::Error;
+use vm_allocator::GuestMemory;
 use vm_allocator::page_size::get_page_size;
-use vm_allocator::{AddressAllocator, GuestMemory, SystemAllocator};
 use vm_device::{BusDeviceSync, Resource};
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryBackend,
-    GuestMemoryError, GuestMemoryRegion, Le32, Le64, VolatileMemory,
+    ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryBackend, GuestMemoryError,
+    GuestMemoryRegion, Le32, Le64, VolatileMemory,
 };
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
@@ -486,7 +486,6 @@ pub struct PvmemcontrolPciDevice {
     id: String,
     bdf: PciBdf,
     configuration: PciConfiguration,
-    bar_regions: Vec<PciBarConfiguration>,
 }
 
 impl PvmemcontrolBusDevice {
@@ -817,7 +816,6 @@ impl PvmemcontrolDevice {
                 id,
                 bdf,
                 configuration,
-                bar_regions: Vec::new(),
             },
             PvmemcontrolBusDevice { mem, dev },
         )
@@ -860,9 +858,6 @@ impl PciDevice for PvmemcontrolPciDevice {
 
     fn allocate_bars(
         &mut self,
-        _allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        _mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,
     ) -> Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
@@ -877,7 +872,7 @@ impl PciDevice for PvmemcontrolPciDevice {
                 if let Resource::PciBar { index, base, .. } = resource
                     && index == bar_id
                 {
-                    bar_addr = Some(GuestAddress(base));
+                    bar_addr = Some(base);
                     break;
                 }
             }
@@ -886,14 +881,11 @@ impl PciDevice for PvmemcontrolPciDevice {
             }
         }
 
-        let alignment = if restoring { None } else { Some(region_size) };
-        let bar_addr = mmio32_allocator
-            .allocate(bar_addr, region_size, alignment)
-            .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
-
+        // A new BAR is unassigned, for the guest to place.
+        let bar_addr = bar_addr.unwrap_or_default();
         let bar = PciBarConfiguration::default()
             .set_index(bar_id)
-            .set_address(bar_addr.raw_value())
+            .set_address(bar_addr)
             .set_size(region_size)
             .set_region_type(region_type)
             .set_prefetchable(PciBarPrefetchable::NotPrefetchable);
@@ -901,33 +893,11 @@ impl PciDevice for PvmemcontrolPciDevice {
         if !restoring {
             self.configuration
                 .add_pci_bar(&bar)
-                .map_err(|e| PciDeviceError::IoRegistrationFailed(bar_addr.raw_value(), e))?;
+                .map_err(|e| PciDeviceError::IoRegistrationFailed(bar_addr, e))?;
         }
 
         bars.push(bar);
-        self.bar_regions.clone_from(&bars);
         Ok(bars)
-    }
-
-    fn free_bars(
-        &mut self,
-        _allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        _mmio64_allocator: &mut AddressAllocator,
-    ) -> Result<(), PciDeviceError> {
-        for bar in self.bar_regions.drain(..) {
-            mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
-        }
-        Ok(())
-    }
-
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
-        for bar in self.bar_regions.iter_mut() {
-            if bar.idx() == bar_idx {
-                *bar = bar.set_address(new_base);
-            }
-        }
-        Ok(())
     }
 }
 

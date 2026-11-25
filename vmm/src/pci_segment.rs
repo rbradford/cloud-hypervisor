@@ -50,15 +50,12 @@ pub(crate) struct PciSegment {
     // List of allocated IRQs for each PCI slot.
     pub(crate) pci_irq_slots: [u8; 32],
 
-    // Device memory covered by this segment
+    // Device memory covered by this segment, for the guest to assign to BARs
     pub(crate) start_of_mem32_area: u64,
     pub(crate) end_of_mem32_area: u64,
 
     pub(crate) start_of_mem64_area: u64,
     pub(crate) end_of_mem64_area: u64,
-
-    pub(crate) mem32_allocator: Arc<Mutex<AddressAllocator>>,
-    pub(crate) mem64_allocator: Arc<Mutex<AddressAllocator>>,
     // Parts of the 64-bit area clear of reserved ranges
     mem64_ranges: Vec<RangeInclusive<u64>>,
 }
@@ -76,8 +73,8 @@ impl PciSegment {
         id: u16,
         numa_node: u32,
         address_manager: &Arc<AddressManager>,
-        mem32_allocator: Arc<Mutex<AddressAllocator>>,
-        mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem32_allocator: &Mutex<AddressAllocator>,
+        mem64_allocator: &Mutex<AddressAllocator>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         state: Option<PciSegmentState>,
@@ -122,8 +119,6 @@ impl PciSegment {
             pci_devices_down: state.pci_devices_down,
             #[cfg(target_arch = "x86_64")]
             pci_config_io: None,
-            mem32_allocator,
-            mem64_allocator,
             start_of_mem32_area,
             end_of_mem32_area,
             start_of_mem64_area,
@@ -151,8 +146,8 @@ impl PciSegment {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn new_default_segment(
         address_manager: &Arc<AddressManager>,
-        mem32_allocator: Arc<Mutex<AddressAllocator>>,
-        mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem32_allocator: &Mutex<AddressAllocator>,
+        mem64_allocator: &Mutex<AddressAllocator>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         pci_config_io_state: Option<PciConfigIoState>,
@@ -190,8 +185,8 @@ impl PciSegment {
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     pub(crate) fn new_default_segment(
         address_manager: &Arc<AddressManager>,
-        mem32_allocator: Arc<Mutex<AddressAllocator>>,
-        mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem32_allocator: &Mutex<AddressAllocator>,
+        mem64_allocator: &Mutex<AddressAllocator>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         state: Option<PciSegmentState>,
@@ -275,8 +270,8 @@ impl PciSegment {
     fn new_without_address_manager(
         id: u16,
         numa_node: u32,
-        mem32_allocator: Arc<Mutex<AddressAllocator>>,
-        mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mem32_allocator: &Mutex<AddressAllocator>,
+        mem64_allocator: &Mutex<AddressAllocator>,
         mem64_ranges: Vec<RangeInclusive<u64>>,
         pci_irq_slots: &[u8; 32],
         device_reloc: &Arc<dyn DeviceRelocation>,
@@ -308,8 +303,6 @@ impl PciSegment {
             pci_devices_down: 0,
             #[cfg(target_arch = "x86_64")]
             pci_config_io: None,
-            mem32_allocator,
-            mem64_allocator,
             start_of_mem32_area,
             end_of_mem32_area,
             start_of_mem64_area,
@@ -660,8 +653,8 @@ mod tests {
         PciSegment::new_without_address_manager(
             id,
             0,
-            allocator_1,
-            allocator_2,
+            &allocator_1,
+            &allocator_2,
             vec![RangeInclusive::new(
                 guest_addr,
                 guest_addr + guest_size as u64 - 1,

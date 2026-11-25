@@ -16,9 +16,9 @@ use pci::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vm_allocator::{AddressAllocator, GuestRegion, SystemAllocator};
+use vm_allocator::GuestRegion;
 use vm_device::{BusDevice, Resource};
-use vm_memory::{Address, GuestAddress, GuestMemoryRegion};
+use vm_memory::{GuestAddress, GuestMemoryRegion};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
 const IVSHMEM_BAR0_IDX: usize = 0;
@@ -172,9 +172,6 @@ impl BusDevice for IvshmemDevice {
 impl PciDevice for IvshmemDevice {
     fn allocate_bars(
         &mut self,
-        _allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,
     ) -> result::Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
@@ -187,11 +184,11 @@ impl PciDevice for IvshmemDevice {
                 match resource {
                     Resource::PciBar { index, base, .. } => match index {
                         IVSHMEM_BAR0_IDX => {
-                            bar0_addr = Some(GuestAddress(base));
+                            bar0_addr = Some(base);
                         }
                         IVSHMEM_BAR1_IDX => {}
                         IVSHMEM_DATA_BAR_IDX => {
-                            data_bar_addr = Some(GuestAddress(base));
+                            data_bar_addr = Some(base);
                         }
                         _ => {
                             error!("Unexpected pci bar index {index}");
@@ -207,20 +204,14 @@ impl PciDevice for IvshmemDevice {
             }
         }
 
+        // New BARs are unassigned, for the guest to place.
         // BAR0 holds device registers (256 Byte MMIO)
-        let bar0_alignment = if restoring {
-            None
-        } else {
-            Some(IVSHMEM_REG_BAR_SIZE)
-        };
-        let bar0_addr = mmio32_allocator
-            .allocate(bar0_addr, IVSHMEM_REG_BAR_SIZE, bar0_alignment)
-            .ok_or(PciDeviceError::IoAllocationFailed(IVSHMEM_REG_BAR_SIZE))?;
-        debug!("ivshmem bar0 address 0x{:x}", bar0_addr.0);
+        let bar0_addr = bar0_addr.unwrap_or_default();
+        debug!("ivshmem bar0 address 0x{bar0_addr:x}");
 
         let bar0 = PciBarConfiguration::default()
             .set_index(IVSHMEM_BAR0_IDX)
-            .set_address(bar0_addr.raw_value())
+            .set_address(bar0_addr)
             .set_size(IVSHMEM_REG_BAR_SIZE)
             .set_region_type(PciBarRegionType::Memory32BitRegion)
             .set_prefetchable(PciBarPrefetchable::NotPrefetchable);
@@ -228,27 +219,23 @@ impl PciDevice for IvshmemDevice {
         // BAR1 holds MSI-X table and PBA (only ivshmem-doorbell).
 
         // The data BAR maps the shared memory object
-        let data_bar_size = self.region_size;
-        let data_bar_alignment = if restoring { None } else { Some(data_bar_size) };
-        let data_bar_addr = mmio64_allocator
-            .allocate(data_bar_addr, data_bar_size, data_bar_alignment)
-            .ok_or(PciDeviceError::IoAllocationFailed(data_bar_size))?;
-        debug!("ivshmem data BAR address 0x{:x}", data_bar_addr.0);
+        let data_bar_addr = data_bar_addr.unwrap_or_default();
+        debug!("ivshmem data BAR address 0x{data_bar_addr:x}");
 
         let data_bar = PciBarConfiguration::default()
             .set_index(IVSHMEM_DATA_BAR_IDX)
-            .set_address(data_bar_addr.raw_value())
-            .set_size(data_bar_size)
+            .set_address(data_bar_addr)
+            .set_size(self.region_size)
             .set_region_type(PciBarRegionType::Memory64BitRegion)
             .set_prefetchable(PciBarPrefetchable::Prefetchable);
 
         if !restoring {
             self.configuration
                 .add_pci_bar(&bar0)
-                .map_err(|e| PciDeviceError::IoRegistrationFailed(bar0_addr.raw_value(), e))?;
+                .map_err(|e| PciDeviceError::IoRegistrationFailed(bar0_addr, e))?;
             self.configuration
                 .add_pci_bar(&data_bar)
-                .map_err(|e| PciDeviceError::IoRegistrationFailed(data_bar_addr.raw_value(), e))?;
+                .map_err(|e| PciDeviceError::IoRegistrationFailed(data_bar_addr, e))?;
         }
 
         bars.push(bar0);
@@ -256,15 +243,6 @@ impl PciDevice for IvshmemDevice {
         self.bar_regions = bars.clone();
 
         Ok(bars)
-    }
-
-    fn free_bars(
-        &mut self,
-        _allocator: &mut SystemAllocator,
-        _mmio32_allocator: &mut AddressAllocator,
-        _mmio64_allocator: &mut AddressAllocator,
-    ) -> result::Result<(), PciDeviceError> {
-        unimplemented!("Device hotplug  and remove are not supported for ivshmem");
     }
 
     fn write_config_register(

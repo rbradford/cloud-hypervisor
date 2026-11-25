@@ -24,13 +24,12 @@ use pci::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{Queue, QueueT};
-use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig,
 };
 use vm_device::{BusDevice, PciBarType, Resource};
-use vm_memory::{Address, ByteValued, GuestAddress, GuestAddressSpace, GuestMemoryRegion, Le32};
+use vm_memory::{ByteValued, GuestAddress, GuestAddressSpace, GuestMemoryRegion, Le32};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
 use vmm_sys_util::eventfd::EventFd;
@@ -290,8 +289,6 @@ const MSIX_PBA_BAR_OFFSET: u64 = next_bar_addr(MSIX_TABLE_BAR_OFFSET, MSIX_TABLE
 const MSIX_PBA_SIZE: u64 = 0x800;
 // The BAR size must be a power of 2.
 const CAPABILITY_BAR_SIZE: u64 = (MSIX_PBA_BAR_OFFSET + MSIX_PBA_SIZE).next_power_of_two();
-// Align larger than natural alignment to work around Windows driver issues
-const VIRTIO_PCI_BAR_ALIGN: u64 = 0x80_0000;
 pub const VIRTIO_CONFIG_BAR_INDEX: usize = 0;
 pub const VIRTIO_SHM_BAR_INDEX: usize = 2;
 
@@ -409,11 +406,9 @@ pub struct VirtioPciDevice {
     // a device.
     cap_pci_cfg_info: VirtioPciCfgCapInfo,
 
-    // Address of the shared memory BAR, where the shared memory is mapped
+    // Address the guest assigned to the shared memory BAR, zero while it is
+    // unassigned
     shm_bar_addr: u64,
-
-    // Details of bar regions to free
-    bar_regions: Vec<PciBarConfiguration>,
 
     // EventFd to signal on to request activation
     activate_evt: EventFd,
@@ -646,7 +641,6 @@ impl VirtioPciDevice {
             use_64bit_bar,
             cap_pci_cfg_info,
             shm_bar_addr: 0,
-            bar_regions: vec![],
             activate_evt,
             dma_handler,
             pending_activations,
@@ -1067,9 +1061,6 @@ impl PciDevice for VirtioPciDevice {
 
     fn allocate_bars(
         &mut self,
-        _allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
         resources: Option<Vec<Resource>>,
     ) -> result::Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
@@ -1077,7 +1068,7 @@ impl PciDevice for VirtioPciDevice {
         let device = device_clone.lock().unwrap();
 
         let mut settings_bar_addr = None;
-        let mut shm_bar_addr = None;
+        let mut shm_bar_addr = 0;
         let mut use_64bit_bar = self.use_64bit_bar;
         let restoring = resources.is_some();
         if let Some(resources) = resources {
@@ -1089,9 +1080,9 @@ impl PciDevice for VirtioPciDevice {
                     continue;
                 };
                 if index == VIRTIO_SHM_BAR_INDEX {
-                    shm_bar_addr = Some(GuestAddress(base));
+                    shm_bar_addr = base;
                 } else if index == VIRTIO_CONFIG_BAR_INDEX {
-                    settings_bar_addr = Some(GuestAddress(base));
+                    settings_bar_addr = Some(base);
                     use_64bit_bar = match type_ {
                         PciBarType::Io => {
                             return Err(PciDeviceError::InvalidResource(resource));
@@ -1107,34 +1098,18 @@ impl PciDevice for VirtioPciDevice {
             }
         }
 
-        // Allocate the virtio-pci capability BAR.
+        // Add the virtio-pci capability BAR, leaving its address to the guest.
         // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
-        let (virtio_pci_bar_addr, region_type) = if use_64bit_bar {
-            let region_type = PciBarRegionType::Memory64BitRegion;
-            let alignment = if restoring {
-                None
-            } else {
-                Some(VIRTIO_PCI_BAR_ALIGN)
-            };
-            let addr = mmio64_allocator
-                .allocate(settings_bar_addr, CAPABILITY_BAR_SIZE, alignment)
-                .ok_or(PciDeviceError::IoAllocationFailed(CAPABILITY_BAR_SIZE))?;
-            (addr, region_type)
+        let settings_bar_addr = settings_bar_addr.unwrap_or_default();
+        let region_type = if use_64bit_bar {
+            PciBarRegionType::Memory64BitRegion
         } else {
-            let region_type = PciBarRegionType::Memory32BitRegion;
-            let addr = mmio32_allocator
-                .allocate(
-                    settings_bar_addr,
-                    CAPABILITY_BAR_SIZE,
-                    Some(CAPABILITY_BAR_SIZE),
-                )
-                .ok_or(PciDeviceError::IoAllocationFailed(CAPABILITY_BAR_SIZE))?;
-            (addr, region_type)
+            PciBarRegionType::Memory32BitRegion
         };
 
         let bar = PciBarConfiguration::default()
             .set_index(VIRTIO_CONFIG_BAR_INDEX)
-            .set_address(virtio_pci_bar_addr.raw_value())
+            .set_address(settings_bar_addr)
             .set_size(CAPABILITY_BAR_SIZE)
             .set_region_type(region_type);
 
@@ -1143,31 +1118,26 @@ impl PciDevice for VirtioPciDevice {
         // restored from a known state, the BARs are already created with the
         // right content, therefore we don't need to go through this codepath.
         if !restoring {
-            self.configuration.add_pci_bar(&bar).map_err(|e| {
-                PciDeviceError::IoRegistrationFailed(virtio_pci_bar_addr.raw_value(), e)
-            })?;
+            self.configuration
+                .add_pci_bar(&bar)
+                .map_err(|e| PciDeviceError::IoRegistrationFailed(settings_bar_addr, e))?;
 
-            // Once the BARs are allocated, the capabilities can be added to the PCI configuration.
+            // Once the BARs are added, the capabilities can be added to the PCI configuration.
             let device_config_size = device.config_size().unwrap_or(DEVICE_CONFIG_SIZE);
             self.add_pci_capabilities(device_config_size)?;
         }
 
         bars.push(bar);
 
-        // Allocate a dedicated BAR if there are some shared memory regions. The
-        // BAR size is a power of two, with only its start backed by the memory.
+        // Add a dedicated BAR if there are some shared memory regions. The BAR
+        // size is a power of two, with only its start backed by the memory.
         let shm_list = device.get_shm_regions();
         if let Some(shm_list) = &shm_list {
-            let size = shm_list.mapping.lock().unwrap().len().next_power_of_two();
-            let alignment = if restoring { None } else { Some(size) };
-            let addr = mmio64_allocator
-                .allocate(shm_bar_addr, size, alignment)
-                .ok_or(PciDeviceError::IoAllocationFailed(size))?;
-            shm_bar_addr = Some(addr);
+            let size = shm_list.mapping.lock().unwrap().len();
             let bar = PciBarConfiguration::default()
                 .set_index(VIRTIO_SHM_BAR_INDEX)
-                .set_address(addr.raw_value())
-                .set_size(size);
+                .set_address(shm_bar_addr)
+                .set_size(size.next_power_of_two());
 
             // The creation of the PCI BAR and its associated capabilities must
             // happen only during the creation of a brand new VM. When a VM is
@@ -1176,7 +1146,7 @@ impl PciDevice for VirtioPciDevice {
             if !restoring {
                 self.configuration
                     .add_pci_bar(&bar)
-                    .map_err(|e| PciDeviceError::IoRegistrationFailed(addr.raw_value(), e))?;
+                    .map_err(|e| PciDeviceError::IoRegistrationFailed(shm_bar_addr, e))?;
 
                 for (idx, shm) in shm_list.region_list.iter().enumerate() {
                     let shm_cap = VirtioPciCap64::new(
@@ -1196,48 +1166,30 @@ impl PciDevice for VirtioPciDevice {
         }
         drop(device);
 
-        self.bar_regions.clone_from(&bars);
-
-        // The shared memory is mapped at the address of its BAR.
-        if let (Some(_), Some(addr)) = (&shm_list, shm_bar_addr) {
-            self.move_bar(VIRTIO_SHM_BAR_INDEX, addr.raw_value())
+        // A restored BAR maps the shared memory at its saved address.
+        if shm_list.is_some() && shm_bar_addr != 0 {
+            self.move_bar(VIRTIO_SHM_BAR_INDEX, shm_bar_addr)
                 .map_err(|e| PciDeviceError::MapBarMemory(VIRTIO_SHM_BAR_INDEX, e))?;
         }
 
         Ok(bars)
     }
 
-    fn free_bars(
-        &mut self,
-        _allocator: &mut SystemAllocator,
-        mmio32_allocator: &mut AddressAllocator,
-        mmio64_allocator: &mut AddressAllocator,
-    ) -> result::Result<(), PciDeviceError> {
-        for bar in self.bar_regions.drain(..) {
-            match bar.region_type() {
-                PciBarRegionType::Memory32BitRegion => {
-                    mmio32_allocator.free(GuestAddress(bar.addr()), bar.size());
-                }
-                PciBarRegionType::Memory64BitRegion => {
-                    mmio64_allocator.free(GuestAddress(bar.addr()), bar.size());
-                }
-                _ => error!("Unexpected PCI bar type"),
-            }
-        }
-        Ok(())
-    }
-
     fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
         if bar_idx == VIRTIO_SHM_BAR_INDEX
             && let Some(shm_list) = self.device.lock().unwrap().get_shm_regions()
         {
-            // The shared memory is mapped at the address of its BAR.
+            // The shared memory is only mapped while the guest has assigned
+            // the BAR.
             let mut mapping = shm_list.mapping.lock().unwrap();
             let old_address = mapping.start_addr();
             let was_registered = mapping.is_registered();
             let moved = (|| {
+                if new_base == 0 {
+                    mapping.unregister()?;
+                }
                 mapping.move_guest_address(GuestAddress(new_base))?;
-                if !mapping.is_registered() {
+                if new_base != 0 && !mapping.is_registered() {
                     mapping.register()?;
                 }
                 Ok::<_, vm_allocator::GuestRegionError>(())
@@ -1257,12 +1209,6 @@ impl PciDevice for VirtioPciDevice {
                 return Err(io::Error::other(e));
             }
             self.shm_bar_addr = new_base;
-        }
-
-        for bar in self.bar_regions.iter_mut() {
-            if bar.idx() == bar_idx {
-                *bar = bar.set_address(new_base);
-            }
         }
 
         Ok(())
