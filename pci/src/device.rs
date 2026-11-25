@@ -33,6 +33,9 @@ pub enum Error {
     /// Invalid resource.
     #[error("Invalid resource: {0:?}")]
     InvalidResource(Resource),
+    /// Mapping the memory of a BAR failed.
+    #[error("Mapping the memory of BAR {0} failed")]
+    MapBarMemory(usize, #[source] io::Error),
 }
 pub(crate) type Result<T> = result::Result<T, Error>;
 
