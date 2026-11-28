@@ -38,6 +38,7 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
 use super::{Error, PostcopyHandler, PostcopyRegion, Result, VhostUserState};
+use crate::thread_helper::PauseCommon;
 use crate::vhost_user::Inflight;
 use crate::{
     GuestMemory, GuestRegion, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
@@ -548,6 +549,26 @@ impl VhostUserHandle {
         num_queues: u16,
         unlink_socket: bool,
         kill_evt: &EventFd,
+        initialize: impl FnMut(&mut Self) -> Result<()>,
+    ) -> Result<Self> {
+        Self::connect(
+            server,
+            socket_path,
+            num_queues,
+            unlink_socket,
+            kill_evt,
+            None,
+            initialize,
+        )
+    }
+
+    pub(super) fn connect(
+        server: bool,
+        socket_path: &str,
+        num_queues: u16,
+        unlink_socket: bool,
+        kill_evt: &EventFd,
+        reconnect: Option<&PauseCommon>,
         mut initialize: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<Self> {
         if server {
@@ -674,7 +695,9 @@ impl VhostUserHandle {
                     Err(e) => return Err(e),
                 };
 
-                if start.elapsed() >= CONNECT_TIMEOUT {
+                if let Some(pause) = reconnect {
+                    pause.wait_if_paused();
+                } else if start.elapsed() >= CONNECT_TIMEOUT {
                     if connect_failed {
                         error!(
                             "Timed out waiting for vhost-user connection on socket {socket_path}"

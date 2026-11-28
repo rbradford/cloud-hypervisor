@@ -308,6 +308,7 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     /// Flag set by the worker when the vhost-user backend is no longer reachable.
     pub disconnected: Arc<AtomicBool>,
     pub resume_evt: EventFd,
+    pause_common: Arc<PauseCommon>,
 }
 
 impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
@@ -371,12 +372,14 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
 
-        match VhostUserHandle::connect_vhost_user(
+        self.disconnected.store(true, Ordering::Relaxed);
+        match VhostUserHandle::connect(
             self.server,
             &self.socket_path,
             self.vu_num_queues,
             true,
             &self.kill_evt,
+            Some(&self.pause_common),
             |vhost_user| {
                 // Hold the handle lock from sampling memory until the new backend
                 // takes over, so concurrent notifications reach the right connection.
@@ -697,6 +700,7 @@ impl VhostUserCommon {
             inflight,
             disconnected: Arc::clone(&self.disconnected),
             resume_evt,
+            pause_common: Arc::clone(&self.virtio_common.pause_common),
         })
     }
 
@@ -782,6 +786,11 @@ impl VhostUserCommon {
     }
 
     pub fn pause(&mut self) -> result::Result<(), MigratableError> {
+        // Park the client worker first so a reconnect cannot enable queues
+        // after we disable them.
+        if !self.server {
+            self.virtio_common.pause()?;
+        }
         if self.disconnected.load(Ordering::Relaxed) {
             return Err(MigratableError::DeviceDisconnected(
                 self.socket_path.clone(),
@@ -803,7 +812,10 @@ impl VhostUserCommon {
                 self.socket_path
             )));
         }
-        self.virtio_common.pause()
+        if self.server {
+            self.virtio_common.pause()?;
+        }
+        Ok(())
     }
 
     fn resume_internal(&mut self) -> result::Result<(), MigratableError> {
