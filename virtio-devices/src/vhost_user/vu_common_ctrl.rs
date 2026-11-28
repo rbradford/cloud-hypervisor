@@ -56,6 +56,7 @@ pub struct VhostUserConfig {
 
 #[derive(Clone)]
 struct VringInfo {
+    queue_index: u16,
     config_data: VringConfigData,
     used_guest_addr: u64,
 }
@@ -362,6 +363,7 @@ impl VhostUserHandle {
             };
 
             vrings_info.push(VringInfo {
+                queue_index: *queue_index,
                 config_data,
                 used_guest_addr: queue.used_ring(),
             });
@@ -923,7 +925,7 @@ impl VhostUserHandle {
 
     fn set_vring_logging(&mut self, enable: bool) -> Result<()> {
         if let Some(vrings_info) = &self.vrings_info {
-            for (i, vring_info) in vrings_info.iter().enumerate() {
+            for vring_info in vrings_info {
                 let mut config_data = vring_info.config_data;
                 config_data.flags = if enable { 1 << VHOST_VRING_F_LOG } else { 0 };
                 config_data.log_addr = if enable {
@@ -933,7 +935,7 @@ impl VhostUserHandle {
                 };
 
                 self.vu
-                    .set_vring_addr(i, &config_data)
+                    .set_vring_addr(usize::from(vring_info.queue_index), &config_data)
                     .map_err(Error::VhostUserSetVringAddr)?;
             }
         }
