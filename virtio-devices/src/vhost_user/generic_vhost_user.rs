@@ -378,8 +378,7 @@ impl VirtioDevice for GenericVhostUser {
 
 impl Pausable for GenericVhostUser {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        self.vu_common.pause()?;
-        self.vu_common.virtio_common.pause()
+        self.vu_common.pause()
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {

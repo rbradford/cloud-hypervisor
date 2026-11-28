@@ -383,8 +383,7 @@ impl VirtioDevice for Blk {
 
 impl Pausable for Blk {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        self.vu_common.pause()?;
-        self.vu_common.virtio_common.pause()
+        self.vu_common.pause()
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {

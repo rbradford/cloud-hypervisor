@@ -803,7 +803,7 @@ impl VhostUserCommon {
                 self.socket_path
             )));
         }
-        Ok(())
+        self.virtio_common.pause()
     }
 
     fn resume_internal(&mut self) -> result::Result<(), MigratableError> {

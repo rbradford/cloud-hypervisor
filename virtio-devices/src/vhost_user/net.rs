@@ -487,8 +487,7 @@ impl VirtioDevice for Net {
 impl Pausable for Net {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
         self.announce.invalidate();
-        self.vu_common.pause()?;
-        self.vu_common.virtio_common.pause()
+        self.vu_common.pause()
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
