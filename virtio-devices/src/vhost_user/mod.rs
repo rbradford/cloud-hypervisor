@@ -300,6 +300,7 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     pub kill_evt: EventFd,
     pub pause_evt: EventFd,
     pub queues: Vec<(u16, Queue, EventFd)>,
+    vu_num_queues: u16,
     pub virtio_interrupt: Arc<dyn VirtioInterrupt>,
     pub acked_features: u64,
     pub acked_protocol_features: u64,
@@ -373,12 +374,10 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
 
-        let num_queues = u16::try_from(self.queues.len())
-            .map_err(|_| EpollHelperError::IoError(io::Error::other(Error::BadQueueNum)))?;
         match VhostUserHandle::connect_vhost_user(
             self.server,
             &self.socket_path,
-            num_queues,
+            self.vu_num_queues,
             true,
             &self.kill_evt,
             |vhost_user| {
@@ -686,6 +685,7 @@ impl VhostUserCommon {
             kill_evt,
             pause_evt,
             queues,
+            vu_num_queues: self.vu_num_queues,
             virtio_interrupt: interrupt_cb,
             acked_features,
             acked_protocol_features: self.acked_protocol_features,
