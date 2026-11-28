@@ -16,9 +16,7 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vhost::Error as VhostError;
-use vhost::vhost_user::message::{
-    VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
-};
+use vhost::vhost_user::message::{VhostUserInflight, VhostUserProtocolFeatures};
 use vhost::vhost_user::{Error as VhostUserError, FrontendReqHandler, VhostUserFrontendReqHandler};
 use virtio_queue::{Error as QueueError, Queue, QueueT};
 use vm_allocator::GuestMemoryNotification;
@@ -280,8 +278,7 @@ pub const DEFAULT_VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_RING_INDIRECT_DESC)
     | (1 << VIRTIO_F_VERSION_1)
     | (1 << VIRTIO_F_IN_ORDER)
     | (1 << VIRTIO_F_ORDER_PLATFORM)
-    | (1 << VIRTIO_F_NOTIFICATION_DATA)
-    | VhostUserVirtioFeatures::LOG_ALL.bits();
+    | (1 << VIRTIO_F_NOTIFICATION_DATA);
 
 const HUP_CONNECTION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const BACKEND_REQ_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
@@ -973,7 +970,7 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::{assert_matches, thread};
 
-    use vhost::vhost_user::message::{FrontendReq, VhostUserHeaderFlag};
+    use vhost::vhost_user::message::{FrontendReq, VhostUserHeaderFlag, VhostUserVirtioFeatures};
     use vm_memory::{FileOffset, GuestAddress};
     use vm_migration::Snapshottable;
     use vmm_sys_util::tempdir::TempDir;
