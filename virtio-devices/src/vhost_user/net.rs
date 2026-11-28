@@ -366,7 +366,6 @@ impl VirtioDevice for Net {
             .virtio_common
             .activate(&queues, Arc::clone(&interrupt_cb))?;
 
-        let num_queues = u16::try_from(queues.len()).map_err(|_| ActivateError::BadActivate)?;
         let event_idx = self
             .vu_common
             .virtio_common
@@ -375,10 +374,11 @@ impl VirtioDevice for Net {
             .vu_common
             .virtio_common
             .feature_acked(VIRTIO_NET_F_CTRL_VQ.into())
-            && !num_queues.is_multiple_of(2)
+            && let Some(position) = queues
+                .iter()
+                .position(|(index, _, _)| *index == self.vu_common.vu_num_queues)
         {
-            let ctrl_queue_index = num_queues - 1;
-            let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index as usize);
+            let (ctrl_queue_index, mut ctrl_queue, ctrl_queue_evt) = queues.remove(position);
 
             ctrl_queue.set_event_idx(event_idx);
 
