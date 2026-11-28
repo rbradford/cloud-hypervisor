@@ -303,7 +303,7 @@ impl VirtioDevice for Blk {
             interrupt_cb,
             queues,
             device_status,
-            ..
+            restoring,
         } = context;
         self.vu_common
             .virtio_common
@@ -352,6 +352,7 @@ impl VirtioDevice for Blk {
             backend_req_handler,
             kill_evt,
             pause_evt,
+            restoring,
         )?;
 
         self.vu_common.spawn_worker(

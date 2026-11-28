@@ -608,6 +608,7 @@ impl VhostUserCommon {
         backend_req_handler: Option<FrontendReqHandler<T>>,
         kill_evt: EventFd,
         pause_evt: EventFd,
+        restoring: bool,
     ) -> result::Result<VhostUserEpollHandler<T>, ActivateError> {
         self.guest_memory = Some(mem.clone());
 
@@ -655,7 +656,11 @@ impl VhostUserCommon {
             .iter()
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
-        let vring_bases = self.vring_bases.take();
+        let vring_bases = if restoring {
+            self.vring_bases.take()
+        } else {
+            Some(vec![0; queues.len()])
+        };
         vu.lock()
             .unwrap()
             .setup_vhost_user(
@@ -1120,6 +1125,73 @@ mod tests {
                 assert_eq!(state.acked_features & access_platform != 0, enabled);
                 backend.join().unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn activation_sets_vring_base_for_fresh_and_restored_queues() {
+        use virtio_queue::QueueT;
+        use vm_memory::Bytes;
+        use vmm_sys_util::tempfile::TempFile;
+
+        struct BackendReqHandler;
+        impl VhostUserFrontendReqHandler for BackendReqHandler {}
+
+        let backing = TempFile::new().unwrap();
+        let file = backing.as_file().try_clone().unwrap();
+        file.set_len(0x1000).unwrap();
+        let mem = GuestMemory::from_ranges_with_files(&[(
+            GuestAddress(0),
+            0x1000,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        let mut queue = Queue::new(8).unwrap();
+        queue
+            .try_set_avail_ring_address(GuestAddress(0x100))
+            .unwrap();
+        queue
+            .try_set_used_ring_address(GuestAddress(0x200))
+            .unwrap();
+        queue.set_ready(true);
+        // Three buffers have been made available by the driver.
+        mem.memory().write_obj(3u16, GuestAddress(0x102)).unwrap();
+        let event = || EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let queues = [(0, queue, event())];
+
+        for (restoring, saved_bases, expected_base) in [
+            (false, None, 0u32),
+            (true, None, 3),
+            (true, Some(vec![2]), 2),
+        ] {
+            let (vu, mut backend) =
+                connect_handle(VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits());
+            let mut common = VhostUserCommon::new(VirtioCommon::new(restoring).unwrap());
+            common.vu = Some(Arc::new(Mutex::new(vu)));
+            common.vring_bases = saved_bases;
+            common
+                .activate::<BackendReqHandler>(
+                    mem.clone(),
+                    &queues,
+                    Arc::new(NoopVirtioInterrupt {}),
+                    0,
+                    None,
+                    event(),
+                    event(),
+                    restoring,
+                )
+                .unwrap();
+
+            for request in [
+                FrontendReq::SET_FEATURES,
+                FrontendReq::SET_MEM_TABLE,
+                FrontendReq::SET_VRING_NUM,
+                FrontendReq::SET_VRING_ADDR,
+            ] {
+                read_request(&mut backend, request);
+            }
+            let base = read_request(&mut backend, FrontendReq::SET_VRING_BASE);
+            assert_eq!(base[4..], expected_base.to_ne_bytes());
         }
     }
 
