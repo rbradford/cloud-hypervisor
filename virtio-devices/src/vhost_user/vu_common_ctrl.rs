@@ -766,10 +766,7 @@ impl VhostUserHandle {
         self.supports_device_state
     }
 
-    /// Save backend device state via the SET_DEVICE_STATE_FD protocol.
-    /// Returns the opaque state blob and per-queue vring base indices.
-    pub fn save_backend_state(&mut self) -> Result<(Vec<u8>, Vec<u64>)> {
-        // GET_VRING_BASE for each queue to stop the backend and capture indices
+    pub(super) fn stop_vrings(&mut self) -> Result<Vec<u64>> {
         let mut vring_bases = Vec::new();
         for queue_index in &self.queue_indexes {
             let base = self
@@ -782,10 +779,16 @@ impl VhostUserHandle {
         // The backend considers the vrings stopped after GET_VRING_BASE.
         self.ready = false;
 
-        // Store the vring bases in case any of the operation below fails, or
-        // in case we need to resume after snapshot.
+        // Resume needs the bases even if saving device state fails.
         self.vring_bases = Some(vring_bases.clone());
 
+        Ok(vring_bases)
+    }
+
+    /// Save backend device state via the SET_DEVICE_STATE_FD protocol.
+    /// Returns the opaque state blob and per-queue vring base indices.
+    pub fn save_backend_state(&mut self) -> Result<(Vec<u8>, Vec<u64>)> {
+        let vring_bases = self.stop_vrings()?;
         let (local, remote) = UnixStream::pair().map_err(Error::SaveRestoreBackendState)?;
 
         let mut read_file: File = match self
