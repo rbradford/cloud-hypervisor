@@ -897,6 +897,7 @@ impl VhostUserCommon {
                 self.saved_dirty_log = Some(self.dirty_log()?);
             }
             self.shutdown();
+            self.dirty_logging = false;
         }
 
         Ok(snapshot)
@@ -927,7 +928,9 @@ impl VhostUserCommon {
     }
 
     pub fn stop_dirty_log(&mut self) -> result::Result<(), MigratableError> {
-        if let Some(vu) = &self.vu {
+        if self.dirty_logging
+            && let Some(vu) = &self.vu
+        {
             vu.lock().unwrap().stop_dirty_log().map_err(|e| {
                 MigratableError::StopDirtyLog(anyhow!(
                     "Error stopping migration for vhost-user backend: {e:?}"
@@ -940,6 +943,9 @@ impl VhostUserCommon {
     }
 
     pub fn dirty_log(&mut self) -> result::Result<MemoryRangeTable, MigratableError> {
+        if let Some(log) = self.saved_dirty_log.take() {
+            return Ok(log);
+        }
         if let Some(vu) = &self.vu {
             if let Some(guest_memory) = &self.guest_memory {
                 let last_ram_addr = guest_memory.memory().last_addr().raw_value();
@@ -952,7 +958,7 @@ impl VhostUserCommon {
                 Err(MigratableError::DirtyLog(anyhow!("Missing guest memory")))
             }
         } else {
-            Ok(self.saved_dirty_log.take().unwrap_or_default())
+            Ok(MemoryRangeTable::default())
         }
     }
 
@@ -963,6 +969,7 @@ impl VhostUserCommon {
 
     pub fn notify_failed_migration(&mut self) -> result::Result<(), MigratableError> {
         self.migration_started = false;
+        self.saved_dirty_log = None;
         Ok(())
     }
 
