@@ -274,7 +274,7 @@ impl VirtioDevice for GenericVhostUser {
         };
         if let Err(e) = vu.lock().unwrap().socket_handle().set_config(
             offset.try_into().unwrap(),
-            VhostUserConfigFlags::WRITABLE,
+            VhostUserConfigFlags::empty(),
             data,
         ) {
             error!("Failed setting generic vhost-user configuration: {e}");

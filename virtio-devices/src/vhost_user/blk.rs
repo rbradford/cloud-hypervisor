@@ -281,7 +281,7 @@ impl VirtioDevice for Blk {
             let mut vu = vu.lock().unwrap();
             let result = vu
                 .socket_handle()
-                .set_config(offset as u32, VhostUserConfigFlags::WRITABLE, data)
+                .set_config(offset as u32, VhostUserConfigFlags::empty(), data)
                 .map_err(Error::VhostUserSetConfig);
             self.config.lock().unwrap().writeback = data[0];
 
