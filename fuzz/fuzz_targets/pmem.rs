@@ -123,6 +123,7 @@ fn run_pmem_case(
             interrupt_cb: Arc::new(HarnessInterrupt { fail_interrupt }),
             queues: vec![(0, queue, evt)],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .is_err()
     {
@@ -199,6 +200,7 @@ fn run_bad_activate_case(cursor: &mut FuzzCursor<'_>) -> bool {
         }),
         queues: vec![],
         device_status: Arc::new(std::sync::atomic::AtomicU8::new(cursor.next_u8())),
+        restoring: false,
     })
     .is_err()
 }

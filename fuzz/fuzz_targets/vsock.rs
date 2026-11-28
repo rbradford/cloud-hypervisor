@@ -470,6 +470,7 @@ fn run_worker_scenario(
         interrupt_cb,
         queues: queues_with_evts,
         device_status: Arc::new(AtomicU8::new(0)),
+        restoring: false,
     });
     vsock.wait_for_epoll_threads();
     vsock.reset();
@@ -641,6 +642,7 @@ fn exercise_device_paths(bytes: &[u8]) {
         }),
         queues: Vec::new(),
         device_status: Arc::new(AtomicU8::new(0)),
+        restoring: false,
     });
 
     let mut queues = Vec::with_capacity(NUM_QUEUES as usize);
@@ -657,6 +659,7 @@ fn exercise_device_paths(bytes: &[u8]) {
         }),
         queues,
         device_status: Arc::new(AtomicU8::new(0)),
+        restoring: false,
     });
     device.wait_for_epoll_threads();
     device.reset();

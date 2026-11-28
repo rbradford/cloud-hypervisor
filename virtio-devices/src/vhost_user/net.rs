@@ -361,6 +361,7 @@ impl VirtioDevice for Net {
             interrupt_cb,
             mut queues,
             device_status,
+            ..
         } = context;
         self.vu_common
             .virtio_common

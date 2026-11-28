@@ -249,6 +249,7 @@ impl VirtioDevice for Fs {
             interrupt_cb,
             queues,
             device_status,
+            ..
         } = context;
         self.vu_common
             .virtio_common

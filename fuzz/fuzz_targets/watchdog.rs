@@ -355,6 +355,7 @@ fn run_watchdog_case(bytes: &[u8], mode: usize) -> Result<(), ()> {
         }),
         queues,
         device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        restoring: false,
     });
     match config.activation_mode {
         ActivationMode::Normal => activate_result.map_err(|_| ())?,

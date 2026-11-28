@@ -795,6 +795,7 @@ impl VirtioDevice for Console {
             interrupt_cb,
             mut queues,
             device_status,
+            ..
         } = context;
         self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
         self.resizer

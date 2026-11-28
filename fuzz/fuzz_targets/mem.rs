@@ -381,6 +381,7 @@ fn run_device_scenario(stream: &mut FuzzCursor, kind: ScenarioKind) -> Result<()
             }),
             queues: vec![(0, queue, evt)],
             device_status: Arc::new(AtomicU8::new(0)),
+            restoring: false,
         })
         .is_err()
     {

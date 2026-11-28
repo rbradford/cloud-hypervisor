@@ -249,6 +249,7 @@ fn run_console_case(bytes: &[u8], cursor_offset: usize, mode: u8) -> Result<(), 
             interrupt_cb: interrupt,
             queues: vec![(0, input_queue, input_evt), (1, output_queue, output_evt)],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .is_err()
     {
@@ -343,6 +344,7 @@ fn exercise_queue_event_read_error(
             }),
             queues: vec![(0, input_queue, input_evt), (1, output_queue, output_evt)],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .is_err()
     {
@@ -378,6 +380,7 @@ fn exercise_activation_failure(
         }),
         queues: Vec::new(),
         device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        restoring: false,
     });
 
     Ok(())
@@ -442,6 +445,7 @@ fn exercise_restored_input_queue(
             }),
             queues: vec![(0, input_queue, input_evt), (1, output_queue, output_evt)],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .is_err()
     {

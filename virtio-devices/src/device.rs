@@ -67,6 +67,7 @@ pub struct ActivationContext {
     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
     pub queues: Vec<(u16, Queue, EventFd)>,
     pub device_status: Arc<AtomicU8>,
+    pub restoring: bool,
 }
 
 /// Trait for virtio devices to be driven by a virtio transport.

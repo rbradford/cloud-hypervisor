@@ -328,6 +328,7 @@ pub struct VirtioPciDeviceActivator {
     barrier: Option<Arc<Barrier>>,
     id: String,
     status: Arc<AtomicU8>,
+    restoring: bool,
 }
 
 impl VirtioPciDeviceActivator {
@@ -337,6 +338,7 @@ impl VirtioPciDeviceActivator {
             interrupt_cb: Arc::clone(&self.interrupt),
             queues: self.queues.take().unwrap(),
             device_status: Arc::clone(&self.status),
+            restoring: self.restoring,
         });
 
         if let Err(e) = &result {
@@ -655,11 +657,14 @@ impl VirtioPciDevice {
         if virtio_pci_device.device_activated.load(Ordering::SeqCst)
             && virtio_pci_device.is_driver_ready()
         {
-            virtio_pci_device.activate().map_err(|e| {
-                VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
-                    "Failed activating the device: {e}"
-                ))
-            })?;
+            virtio_pci_device
+                .prepare_activator(None, true)
+                .activate()
+                .map_err(|e| {
+                    VirtioPciDeviceError::CreateVirtioPciDevice(anyhow!(
+                        "Failed activating the device: {e}"
+                    ))
+                })?;
         }
 
         Ok(virtio_pci_device)
@@ -854,7 +859,11 @@ impl VirtioPciDevice {
         Arc::clone(&self.device)
     }
 
-    fn prepare_activator(&mut self, barrier: Option<Arc<Barrier>>) -> VirtioPciDeviceActivator {
+    fn prepare_activator(
+        &mut self,
+        barrier: Option<Arc<Barrier>>,
+        restoring: bool,
+    ) -> VirtioPciDeviceActivator {
         let mut queues = Vec::new();
 
         for (queue_index, queue) in self.queues.iter().enumerate() {
@@ -883,11 +892,8 @@ impl VirtioPciDevice {
             barrier,
             id: self.id.clone(),
             status: Arc::clone(&self.common_config.driver_status),
+            restoring,
         }
-    }
-
-    fn activate(&mut self) -> ActivateResult {
-        self.prepare_activator(None).activate()
     }
 
     fn needs_activation(&self) -> bool {
@@ -1333,7 +1339,7 @@ impl PciDevice for VirtioPciDevice {
         // Try and activate the device if the driver status has changed (from unready to ready)
         if !initial_ready && self.needs_activation() {
             let barrier = Arc::new(Barrier::new(2));
-            let activator = self.prepare_activator(Some(Arc::clone(&barrier)));
+            let activator = self.prepare_activator(Some(Arc::clone(&barrier)), false);
             self.pending_activations.lock().unwrap().push(activator);
             info!(
                 "{}: Needs activation; writing to activate event fd",
@@ -1702,6 +1708,7 @@ mod tests {
             barrier: Some(Arc::clone(&barrier)),
             id: "test-dev".to_string(),
             status: Arc::clone(&status),
+            restoring: false,
         };
         (activator, status, device_activated, interrupt, barrier)
     }

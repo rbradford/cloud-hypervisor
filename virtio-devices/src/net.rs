@@ -847,6 +847,7 @@ impl VirtioDevice for Net {
             interrupt_cb,
             mut queues,
             device_status,
+            ..
         } = context;
         self.device_status = device_status;
         self.common.activate(&queues, Arc::clone(&interrupt_cb))?;

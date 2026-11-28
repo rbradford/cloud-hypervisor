@@ -176,6 +176,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
                 (2, reporting_q, reporting_evt),
             ],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .ok();
     balloon.resize(BALLOON_SIZE / 4).ok();
@@ -227,6 +228,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
                 interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
                 queues: vec![(0, inflate_q, inflate_evt), (1, deflate_q, deflate_evt)],
                 device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                restoring: false,
             })
             .ok();
         balloon_no_reporting.wait_for_epoll_threads();
@@ -285,6 +287,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
                     (2, reporting_q, reporting_evt),
                 ],
                 device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                restoring: false,
             })
             .ok();
         balloon_reporting_empty.wait_for_epoll_threads();
@@ -487,6 +490,7 @@ fn exercise_stats_queue(bytes: &[u8], queue_data: &[u8]) {
                 (2, stats_q, stats_evt),
             ],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .ok();
     balloon.wait_for_epoll_threads();
@@ -619,6 +623,7 @@ fn run_failing_interrupt_case(
                 (2, reporting_q, reporting_evt),
             ],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .ok();
     let resized = BALLOON_SIZE.saturating_sub((u64::from(bytes[22] & 0x3f)) << 12);
@@ -664,6 +669,7 @@ fn activate_with_too_few_queues(queue_data: &[u8]) {
             interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
             queues: vec![(0, inflate_q, inflate_evt)],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .ok();
     balloon.reset();
@@ -711,6 +717,7 @@ fn activate_reporting_acked_without_reporting_queue(queue_data: &[u8]) {
             interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
             queues: vec![(0, inflate_q, inflate_evt), (1, deflate_q, deflate_evt)],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .ok();
     balloon.wait_for_epoll_threads();
@@ -769,6 +776,7 @@ fn activate_reporting_available_unacked(queue_data: &[u8]) {
                 (2, reporting_q, reporting_evt),
             ],
             device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            restoring: false,
         })
         .ok();
     balloon.wait_for_epoll_threads();

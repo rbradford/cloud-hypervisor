@@ -1178,6 +1178,7 @@ impl VirtioDevice for Block {
             interrupt_cb,
             mut queues,
             device_status,
+            ..
         } = context;
         self.device_status = device_status;
         // See if the guest didn't ack the device being read-only.
@@ -1599,6 +1600,7 @@ mod tests {
                 interrupt_cb: Arc::new(QueueInterruptSender(Mutex::new(tx))),
                 queues: vec![(1, vq.create_queue(), queue_evt.try_clone().unwrap())],
                 device_status: Arc::new(AtomicU8::new(0)),
+                restoring: false,
             })
             .unwrap();
         queue_evt.write(1).unwrap();

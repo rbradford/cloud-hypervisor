@@ -251,6 +251,7 @@ impl VirtioDevice for Rng {
             interrupt_cb,
             mut queues,
             device_status,
+            ..
         } = context;
         self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;

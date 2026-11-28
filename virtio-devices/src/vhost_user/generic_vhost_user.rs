@@ -287,6 +287,7 @@ impl VirtioDevice for GenericVhostUser {
             interrupt_cb,
             queues,
             device_status,
+            ..
         } = context;
         self.vu_common
             .virtio_common

@@ -528,6 +528,7 @@ where
             interrupt_cb,
             queues,
             device_status,
+            ..
         } = context;
         self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
@@ -686,6 +687,7 @@ mod tests {
             interrupt_cb: Arc::new(NoopVirtioInterrupt {}),
             queues: Vec::new(),
             device_status: Arc::new(AtomicU8::new(0)),
+            restoring: false,
         });
         match bad_activate {
             Err(ActivateError::BadActivate) => (),
@@ -715,6 +717,7 @@ mod tests {
                     ),
                 ],
                 device_status: Arc::new(AtomicU8::new(0)),
+                restoring: false,
             })
             .unwrap();
     }

@@ -859,6 +859,7 @@ fn run_stateful_activation(
         }),
         queues: active_queues,
         device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        restoring: false,
     });
 
     if activation.is_ok() {
@@ -930,6 +931,7 @@ fn exercise_bad_activate(guest_mac_addr: net_util::MacAddr) {
         }),
         queues: vec![(0, queue, queue_evt)],
         device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        restoring: false,
     });
     VirtioDevice::reset(&mut net);
 }
@@ -1291,6 +1293,7 @@ fn exercise_bad_tap_activation(guest_mac_addr: net_util::MacAddr, rx_avail_idx: 
         }),
         queues: vec![(0, input_queue, input_evt), (1, output_queue, output_evt)],
         device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        restoring: false,
     });
     if activation.is_ok() {
         net.wait_for_epoll_threads();
@@ -1388,6 +1391,7 @@ fn exercise_bad_queue_activation(guest_mac_addr: net_util::MacAddr, bad_avail_ri
         }),
         queues: vec![(0, input_queue, input_evt), (1, output_queue, output_evt)],
         device_status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        restoring: false,
     });
     if activation.is_ok() {
         net.wait_for_epoll_threads();

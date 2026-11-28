@@ -721,6 +721,7 @@ mod tests {
             interrupt_cb: Arc::new(NoopInterrupt),
             queues: vec![],
             device_status: Arc::new(AtomicU8::new(0)),
+            restoring: false,
         };
 
         assert_matches!(
@@ -751,6 +752,7 @@ mod tests {
             interrupt_cb: Arc::new(NoopInterrupt),
             queues: vec![],
             device_status: Arc::new(AtomicU8::new(0)),
+            restoring: false,
         };
 
         let mut config = [0u8; 4];

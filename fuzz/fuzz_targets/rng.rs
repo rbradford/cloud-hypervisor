@@ -156,6 +156,7 @@ fn run_rng_case(bytes: &[u8], offset: usize, mode: u8) -> Result<(), ()> {
             interrupt_cb: Arc::new(FuzzVirtioInterrupt { fail_interrupt }),
             queues: vec![(0, q, evt)],
             device_status: Arc::new(AtomicU8::new(cursor.next_u8())),
+            restoring: false,
         })
         .is_err()
     {
@@ -245,6 +246,7 @@ fn run_bad_activate_case(bytes: &[u8]) {
         }),
         queues: vec![],
         device_status: Arc::new(AtomicU8::new(bytes[0])),
+        restoring: false,
     });
 }
 

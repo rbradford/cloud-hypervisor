@@ -994,6 +994,7 @@ impl VirtioDevice for Balloon {
             interrupt_cb,
             mut queues,
             device_status,
+            ..
         } = context;
         if [INFLATE_QUEUE, DEFLATE_QUEUE]
             .iter()
@@ -1489,6 +1490,7 @@ mod tests {
                     ),
                 ],
                 device_status: Arc::new(AtomicU8::new(0)),
+                restoring: false,
             })
             .unwrap();
         reporting_queue_evt.write(1).unwrap();
