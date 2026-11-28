@@ -81,6 +81,7 @@ pub struct VhostUserHandle {
     pub(super) vring_bases: Option<Vec<u64>>,
     mapped_regions: Option<BTreeSet<u64>>,
     postcopy_ctx: Option<PostcopyContext>,
+    pub(super) reconnect: bool,
     pub(super) unlink_socket: bool,
 }
 
@@ -598,6 +599,7 @@ impl VhostUserHandle {
                 vring_bases: None,
                 mapped_regions: None,
                 postcopy_ctx: None,
+                reconnect: true,
                 unlink_socket: true,
             };
             vhost_user
@@ -657,6 +659,7 @@ impl VhostUserHandle {
                         vring_bases: None,
                         mapped_regions: None,
                         postcopy_ctx: None,
+                        reconnect: true,
                         unlink_socket: false,
                     })
                     .map_err(Error::VhostUserConnect);
@@ -1077,6 +1080,7 @@ mod tests {
             vring_bases: None,
             mapped_regions: None,
             postcopy_ctx: None,
+            reconnect: true,
             unlink_socket: false,
         }
     }

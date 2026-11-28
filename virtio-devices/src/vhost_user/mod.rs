@@ -356,6 +356,9 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
     ) -> result::Result<(), EpollHelperError> {
         let unlink_socket = {
             let mut vu = self.vu.lock().unwrap();
+            if !vu.reconnect {
+                return Ok(());
+            }
             if vu.postcopy_handler().is_some() {
                 return Err(EpollHelperError::IoError(io::Error::other(
                     Error::PostcopyReconnect,
@@ -880,6 +883,10 @@ impl VhostUserCommon {
                 })?;
                 state.backend_state = Some(backend_state);
                 state.vring_bases = Some(vring_bases);
+            } else if self.migration_started && self.virtio_common.workers.is_some() {
+                vu_locked.stop_vrings().map_err(|e| {
+                    MigratableError::Snapshot(anyhow!("Failed stopping vhost-user vrings: {e:?}"))
+                })?;
             }
         }
 
@@ -897,7 +904,26 @@ impl VhostUserCommon {
             if self.dirty_logging {
                 self.saved_dirty_log = Some(self.dirty_log()?);
             }
-            self.shutdown();
+            if let Some(vu) = &self.vu
+                && self.virtio_common.workers.is_some()
+            {
+                let mut vu = vu.lock().unwrap();
+                // Leave the worker parked with a pending socket hangup. On migration
+                // failure it resumes and reconnects as it would after a backend restart.
+                // SAFETY: vu owns the socket throughout shutdown.
+                if unsafe { libc::shutdown(vu.socket_handle().as_raw_fd(), libc::SHUT_RDWR) } < 0 {
+                    return Err(MigratableError::Snapshot(io::Error::last_os_error().into()));
+                }
+                vu.reconnect = false;
+                self.disconnected.store(true, Ordering::Relaxed);
+                if vu.unlink_socket {
+                    remove_file(&self.socket_path)
+                        .map_err(|e| MigratableError::Snapshot(e.into()))?;
+                    vu.unlink_socket = false;
+                }
+            } else {
+                self.shutdown();
+            }
             self.dirty_logging = false;
         }
 
@@ -971,6 +997,9 @@ impl VhostUserCommon {
     pub fn notify_failed_migration(&mut self) -> result::Result<(), MigratableError> {
         self.migration_started = false;
         self.saved_dirty_log = None;
+        if let Some(vu) = &self.vu {
+            vu.lock().unwrap().reconnect = true;
+        }
         Ok(())
     }
 

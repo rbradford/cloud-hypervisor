@@ -1205,6 +1205,7 @@ fn migration_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError
         (libc::SYS_sendto, vec![]),
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_setsockopt, vec![]),
+        (libc::SYS_shutdown, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_socket, vec![]),
         (libc::SYS_socketpair, vec![]),
@@ -1212,6 +1213,10 @@ fn migration_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError
         (libc::SYS_stat, vec![]),
         (libc::SYS_statx, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_unlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_unlinkat, vec![]),
         (libc::SYS_writev, vec![]),
     ])
 }
