@@ -20,7 +20,7 @@ use vhost::vhost_user::message::{
     VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{Error as VhostUserError, FrontendReqHandler, VhostUserFrontendReqHandler};
-use virtio_queue::{Error as QueueError, Queue};
+use virtio_queue::{Error as QueueError, Queue, QueueT};
 use vm_allocator::GuestMemoryNotification;
 use vm_memory::guest_memory::Error as MmapError;
 use vm_memory::mmap::MmapRegionError;
@@ -626,7 +626,15 @@ impl VhostUserCommon {
         let mut inflight: Option<Inflight> =
             if self.acked_protocol_features & VhostUserProtocolFeatures::INFLIGHT_SHMFD.bits() != 0
             {
-                Some(Inflight::default())
+                let queue_size = queues
+                    .iter()
+                    .map(|(_, queue, _)| queue.size())
+                    .max()
+                    .ok_or(ActivateError::VhostUserSetup(Error::BadQueueNum))?;
+                Some(Inflight {
+                    info: VhostUserInflight::new(0, 0, self.vu_num_queues, queue_size),
+                    fd: None,
+                })
             } else {
                 None
             };

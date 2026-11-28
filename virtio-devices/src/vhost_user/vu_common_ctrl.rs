@@ -15,7 +15,7 @@ use log::{error, info};
 use vhost::vhost_kern::vhost_binding::VHOST_VRING_F_LOG;
 use vhost::vhost_user::message::{
     FrontendReq, VhostTransferStateDirection, VhostTransferStatePhase, VhostUserHeaderFlag,
-    VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+    VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{
     Error as VhostUserError, Frontend, FrontendReqHandler, VhostUserFrontend,
@@ -315,15 +315,9 @@ impl VhostUserHandle {
         // Setup for inflight I/O tracking shared memory.
         if let Some(inflight) = inflight {
             if inflight.fd.is_none() {
-                let inflight_req_info = VhostUserInflight {
-                    mmap_size: 0,
-                    mmap_offset: 0,
-                    num_queues,
-                    queue_size: queues[0].1.size(),
-                };
                 let (info, fd) = self
                     .vu
-                    .get_inflight_fd(&inflight_req_info)
+                    .get_inflight_fd(&inflight.info)
                     .map_err(Error::VhostUserGetInflight)?;
                 inflight.info = info;
                 inflight.fd = Some(fd);
