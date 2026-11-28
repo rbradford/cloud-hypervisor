@@ -78,7 +78,7 @@ pub struct VhostUserHandle {
     acked_features: u64,
     vrings_info: Option<Vec<VringInfo>>,
     queue_indexes: Vec<u16>,
-    vring_bases: Option<Vec<u64>>,
+    pub(super) vring_bases: Option<Vec<u64>>,
     mapped_regions: Option<BTreeSet<u64>>,
     postcopy_ctx: Option<PostcopyContext>,
     pub(super) unlink_socket: bool,
@@ -491,13 +491,16 @@ impl VhostUserHandle {
         acked_protocol_features: u64,
         backend_req_handler: &Option<FrontendReqHandler<S>>,
         inflight: Option<&mut Inflight>,
+        vring_bases: Option<&[u64]>,
     ) -> Result<()> {
         self.set_protocol_features_vhost_user(acked_protocol_features, false)?;
 
         // With in-order processing, used_idx is a contiguous completion boundary.
         // Replay descriptors after it when inflight tracking is not available to
         // recover them more precisely.
-        let vring_bases = if inflight.is_none() && acked_features & (1u64 << VIRTIO_F_IN_ORDER) != 0
+        let used_indices = if vring_bases.is_none()
+            && inflight.is_none()
+            && acked_features & (1u64 << VIRTIO_F_IN_ORDER) != 0
         {
             let mut vring_bases = Vec::with_capacity(queues.len());
             for (_, queue, _) in queues {
@@ -519,7 +522,7 @@ impl VhostUserHandle {
             acked_features,
             backend_req_handler,
             inflight,
-            vring_bases.as_deref(),
+            vring_bases.or(used_indices.as_deref()),
         )?;
 
         for (_, _, queue_evt) in queues {

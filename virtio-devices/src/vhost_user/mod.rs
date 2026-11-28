@@ -396,6 +396,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
                     self.acked_protocol_features,
                     &self.backend_req_handler,
                     self.inflight.as_mut(),
+                    current.vring_bases.as_deref(),
                 )?;
                 mem::swap(&mut *current, vhost_user);
                 self.disconnected.store(false, Ordering::Relaxed);
