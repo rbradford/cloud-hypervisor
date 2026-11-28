@@ -354,17 +354,21 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
         &mut self,
         helper: &mut EpollHelper,
     ) -> result::Result<(), EpollHelperError> {
-        if self.vu.lock().unwrap().postcopy_handler().is_some() {
-            return Err(EpollHelperError::IoError(io::Error::other(
-                Error::PostcopyReconnect,
-            )));
-        }
+        let unlink_socket = {
+            let mut vu = self.vu.lock().unwrap();
+            if vu.postcopy_handler().is_some() {
+                return Err(EpollHelperError::IoError(io::Error::other(
+                    Error::PostcopyReconnect,
+                )));
+            }
 
-        helper.del_event_custom(
-            self.vu.lock().unwrap().socket_handle().as_raw_fd(),
-            HUP_CONNECTION_EVENT,
-            epoll::Events::EPOLLHUP,
-        )?;
+            helper.del_event_custom(
+                vu.socket_handle().as_raw_fd(),
+                HUP_CONNECTION_EVENT,
+                epoll::Events::EPOLLHUP,
+            )?;
+            vu.unlink_socket
+        };
 
         let queues = self
             .queues
@@ -377,7 +381,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
             self.server,
             &self.socket_path,
             self.vu_num_queues,
-            true,
+            unlink_socket,
             &self.kill_evt,
             Some(&self.pause_common),
             |vhost_user| {
@@ -776,7 +780,11 @@ impl VhostUserCommon {
         self.virtio_common.wait_for_epoll_threads();
 
         // Remove socket path if needed
-        if self.server {
+        if self
+            .vu
+            .as_ref()
+            .is_some_and(|vu| vu.lock().unwrap().unlink_socket)
+        {
             let _ = remove_file(&self.socket_path);
         }
 
